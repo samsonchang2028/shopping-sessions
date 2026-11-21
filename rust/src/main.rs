@@ -335,6 +335,26 @@ fn date_days(s: &[u8]) -> Option<i64> {
     Some(days_from_civil(y, mo, d))
 }
 
+/// True iff every byte selected by `mask` (0xFF bytes) of `x` is an ASCII digit '0'..='9'. Unselected bytes are ignored.
+/// A byte b is a digit iff (b & 0xF0) == 0x30 and ((b + 6) & 0xF0) == 0x30; a byte >= 0xFA that carries into its
+/// neighbour is itself rejected, so a carry can never turn a bad input into a good one.
+#[inline]
+fn swar_digits(x: u64, mask: u64) -> bool {
+    let t = x & mask;
+    let lo = (t & 0xF0F0_F0F0_F0F0_F0F0) == (0x3030_3030_3030_3030 & mask);
+    let hi = (t.wrapping_add(0x0606_0606_0606_0606 & mask) & 0xF0F0_F0F0_F0F0_F0F0) == (0x3030_3030_3030_3030 & mask);
+    lo && hi
+}
+
+/// Value of 8 ASCII digits (little-endian load, first digit in the low byte). Digits must already be validated.
+#[inline]
+fn swar_8(x: u64) -> u64 {
+    let mut v = x.wrapping_sub(0x3030_3030_3030_3030);
+    v = (v.wrapping_mul(10) + (v >> 8)) & 0x00FF_00FF_00FF_00FF;
+    v = (v.wrapping_mul(100) + (v >> 16)) & 0x0000_FFFF_0000_FFFF;
+    (v.wrapping_mul(10000) + (v >> 32)) & 0xFFFF_FFFF
+}
+
 /// Per-thread memo of date prefix -> day number. Every entry is computed by `date_days` from the exact 10 bytes
 /// (invalid dates are cached as invalid), so the cache can only repeat what the exact function says.
 struct DateCache {
@@ -365,10 +385,16 @@ fn parse_ts(s: &[u8], dc: &mut DateCache) -> Option<i64> {
     let n = s.len();
     if (n == 20 || n == 25) && s[4] == b'-' {
         let days = dc.days(s)?;
-        if s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+        if s[10] != b'T' {
             return None;
         }
-        let (h, mi, se) = (d2(s, 11)?, d2(s, 14)?, d2(s, 17)?);
+        // "HH:MM:SS" as one 8-byte load: digits at bytes 0,1,3,4,6,7 and ':' at 2 and 5
+        let x = u64::from_le_bytes(s[11..19].try_into().unwrap());
+        if !swar_digits(x, 0xFFFF_00FF_FF00_FFFF) || (x >> 16) as u8 != b':' || (x >> 40) as u8 != b':' {
+            return None;
+        }
+        let dg = |i: u32| ((x >> (8 * i)) as u8 & 0x0F) as i64;
+        let (h, mi, se) = (dg(0) * 10 + dg(1), dg(3) * 10 + dg(4), dg(6) * 10 + dg(7));
         if h > 23 || mi > 59 || se > 59 {
             return None;
         }
@@ -397,6 +423,28 @@ fn parse_ts(s: &[u8], dc: &mut DateCache) -> Option<i64> {
     // F3: ASCII digits only, at most 15 significant digits (more is outside any window), leading zeros fine.
     if n == 0 {
         return None;
+    }
+    if n <= 15 {
+        // at most 15 digits can never exceed 15 significant digits: 8 digits by SWAR, the rest one by one
+        let mut v: u64 = 0;
+        let mut i = 0;
+        if n >= 8 {
+            let x = u64::from_le_bytes(s[0..8].try_into().unwrap());
+            if !swar_digits(x, u64::MAX) {
+                return None;
+            }
+            v = swar_8(x);
+            i = 8;
+        }
+        while i < n {
+            let d = s[i].wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            v = v * 10 + d as u64;
+            i += 1;
+        }
+        return Some(v as i64);
     }
     let mut v: i64 = 0;
     let mut sig = 0;
@@ -907,6 +955,22 @@ fn dump(n: usize, dir: &Path) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 2 && args[1] == "--ts" {
+        // test hook: one timestamp per stdin line (split on \n only), print epoch ms or "None"
+        use std::io::Read;
+        let mut buf = vec![];
+        std::io::stdin().read_to_end(&mut buf).unwrap();
+        let mut dc = DateCache::new();
+        let mut lines: Vec<&[u8]> = buf.split(|&c| c == b'\n').collect();
+        lines.pop();
+        for l in lines {
+            match parse_ts(l, &mut dc) {
+                Some(v) => println!("{v}"),
+                None => println!("None"),
+            }
+        }
+        return;
+    }
     if args.len() == 4 && args[1] == "--dump" {
         dump(args[2].parse().unwrap(), Path::new(&args[3]));
         return;

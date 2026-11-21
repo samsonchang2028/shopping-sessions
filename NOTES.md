@@ -110,6 +110,10 @@ threads); this laptop has 4 cores / 8 threads so each thread runs at roughly hal
 purchases (parse CPU 6.4 -> 5.6 s, wall 2.68 -> 2.55 s A/B). Estimated remaining headroom without a redesign: ~0.3 s
 (SWAR timestamps, merged user hash, front cache for products). Sub-second at 20M needs ~2.5x less total work.
 
+SWAR timestamps (8-byte validate+parse of HH:MM:SS and of 8 epoch-ms digits): parse CPU 5.6 -> 4.9 s, 20M 2.54 -> 2.45 s
+(A/B). tests/test_native_ts.py compares `ss --ts` with the reference on ~20k mutated timestamps. Thread count sweep at 20M
+(4/6/8/12 threads): 8 is best (2.70/2.65/2.57/2.61 s).
+
 ## Rejected ideas / why
 - More/smaller buckets so each bucket's tables fit this CPU's 256 KB L2 (dedup 256->1024, universe shards 256->1024,
   person buckets 1024->4096): dedup 0.44 -> 0.36 s but parse, bucketing and the per-bucket stage got slower; net 2.65 -> 2.75 s
