@@ -114,6 +114,14 @@ SWAR timestamps (8-byte validate+parse of HH:MM:SS and of 8 epoch-ms digits): pa
 (A/B). tests/test_native_ts.py compares `ss --ts` with the reference on ~20k mutated timestamps. Thread count sweep at 20M
 (4/6/8/12 threads): 8 is best (2.70/2.65/2.57/2.61 s).
 
+## Profiling (works without root)
+
+`perf` is blocked (perf_event_paranoid=4) but a SIGPROF sampler works: a scratch copy of `rust/` with `libc`, a signal handler that
+records RIP + the current stage, `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`, then `addr2line -i -C`. It showed the hot spots are
+memory-latency stalls on hash-table probes (shard tables total ~24 MB vs this CPU's 8 MB L3), not instruction counts.
+Fix that worked: one flat id-hash -> person-key table with batched `_mm_prefetch` lookups (16 at a time): bucket-by-person
+0.35 -> 0.18 s, 20M 2.58 -> 2.40 s (A/B). Same trick on the dedup table did NOT help (table is L3-resident): 2.40 -> 2.44 s, reverted.
+
 ## Rejected ideas / why
 - More/smaller buckets so each bucket's tables fit this CPU's 256 KB L2 (dedup 256->1024, universe shards 256->1024,
   person buckets 1024->4096): dedup 0.44 -> 0.36 s but parse, bucketing and the per-bucket stage got slower; net 2.65 -> 2.75 s

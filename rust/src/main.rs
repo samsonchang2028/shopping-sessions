@@ -102,7 +102,8 @@ type IdMap<V> = HashMap<u64, V, std::hash::BuildHasherDefault<IdHasher>>;
 /// check make the engine decline; sharing both (about 2^-96 per pair) is treated as the same ID.
 #[inline]
 fn uhash(b: &[u8]) -> (u64, u32) {
-    (hash_bytes(b), (FixedState::with_seed(0x517c_c1b7_2722_0a95).hash_one(b) >> 32) as u32)
+    let h = hash_bytes(b);
+    (h | (h == 0) as u64, (FixedState::with_seed(0x517c_c1b7_2722_0a95).hash_one(b) >> 32) as u32)
 }
 
 #[inline]
@@ -744,6 +745,63 @@ fn json_str<'a>(j: &'a str, key: &str) -> Option<&'a str> {
     Some(&rest[a..a + b])
 }
 
+/// Flat open-addressing table from an ID hash to its person key, built once and then only read. Lookups are issued
+/// in batches with a prefetch so their memory round trips overlap (this table is far larger than the L3 cache).
+struct PkTable {
+    shift: u32,
+    mask: usize,
+    ents: Vec<(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU32)>,
+}
+impl PkTable {
+    fn new(n: usize) -> PkTable {
+        let cap = (n * 2).max(16).next_power_of_two();
+        let ents = (0..cap)
+            .into_par_iter()
+            .map(|_| (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU32::new(0)))
+            .collect();
+        PkTable { shift: 64 - cap.trailing_zeros(), mask: cap - 1, ents }
+    }
+    #[inline]
+    fn slot(&self, uh: u64) -> usize {
+        (uh >> self.shift) as usize
+    }
+    fn insert(&self, uh: u64, pk: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut i = self.slot(uh);
+        loop {
+            match self.ents[i].0.compare_exchange(0, uh, Relaxed, Relaxed) {
+                Ok(_) => {
+                    self.ents[i].1.store(pk, Relaxed);
+                    return;
+                }
+                Err(cur) if cur == uh => return,
+                Err(_) => i = (i + 1) & self.mask,
+            }
+        }
+    }
+    #[inline]
+    fn prefetch(&self, uh: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(
+                self.ents.as_ptr().add(self.slot(uh)) as *const i8,
+                std::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+    }
+    #[inline]
+    fn get(&self, uh: u64) -> u32 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut i = self.slot(uh);
+        loop {
+            if self.ents[i].0.load(Relaxed) == uh {
+                return self.ents[i].1.load(Relaxed);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
 /// Per-thread scratch plus results for the bucketed per-person pipeline.
 struct Worker {
     acc: Acc,
@@ -1209,7 +1267,7 @@ fn main() {
         parts.push(lb);
     }
     lg.log("  universe: sharded");
-    let mut locals: Vec<(Vec<Raw>, IdMap<(u32, u32)>)> = (0..NBU)
+    let locals: Vec<(Vec<Raw>, IdMap<(u32, u32)>)> = (0..NBU)
         .into_par_iter()
         .map(|u| {
             let mut map: IdMap<(u32, u32)> = IdMap::default();
@@ -1290,13 +1348,13 @@ fn main() {
         }
     }
     let pk: Vec<u32> = (0..n as u32).map(|i| find(&mut parent, i)).collect();
-    // One probe per lookup from here on: replace each shard entry's local index with the final person key.
-    locals.par_iter_mut().enumerate().for_each(|(u, (_, map))| {
-        for v in map.values_mut() {
-            v.1 = pk[rank[(base[u] + v.1) as usize] as usize];
+    // Flat id-hash -> person-key table, built in parallel from the shard tables.
+    let pkt = PkTable::new(n);
+    locals.par_iter().enumerate().for_each(|(u, (_, map))| {
+        for (&uh, v) in map.iter() {
+            pkt.insert(uh, pk[rank[(base[u] + v.1) as usize] as usize]);
         }
     });
-    let id_pk = |uh: u64| -> u32 { locals[shard(uh)].1[&uh].1 };
     lg.log("components");
 
     // ---- bucket events and clicks by person range, then do each bucket's work independently in parallel
@@ -1308,14 +1366,19 @@ fn main() {
         .map(|v| {
             let est = v.len() / NBK + v.len() / NBK / 4 + 8;
             let mut lb: Vec<Vec<E>> = (0..NBK).map(|_| Vec::with_capacity(est)).collect();
-            for e in v {
-                let p = id_pk(e.uh);
-                lb[bucket_of(p)].push(E {
-                    key: ((p as u64) << 32) | e.ts as u64,
-                    price: e.price,
-                    cat: e.cat,
-                    purchase: e.purchase,
-                });
+            for chunk in v.chunks(16) {
+                for e in chunk {
+                    pkt.prefetch(e.uh);
+                }
+                for e in chunk {
+                    let p = pkt.get(e.uh);
+                    lb[bucket_of(p)].push(E {
+                        key: ((p as u64) << 32) | e.ts as u64,
+                        price: e.price,
+                        cat: e.cat,
+                        purchase: e.purchase,
+                    });
+                }
             }
             lb
         })
@@ -1326,9 +1389,14 @@ fn main() {
         .map(|v| {
             let est = v.len() / NBK + v.len() / NBK / 4 + 8;
             let mut lb: Vec<Vec<C>> = (0..NBK).map(|_| Vec::with_capacity(est)).collect();
-            for c in v {
-                let p = id_pk(c.uh);
-                lb[bucket_of(p)].push(C { key: ((p as u64) << 32) | c.ts as u64, camp: c.camp, id: c.line });
+            for chunk in v.chunks(16) {
+                for c in chunk {
+                    pkt.prefetch(c.uh);
+                }
+                for c in chunk {
+                    let p = pkt.get(c.uh);
+                    lb[bucket_of(p)].push(C { key: ((p as u64) << 32) | c.ts as u64, camp: c.camp, id: c.line });
+                }
             }
             lb
         })
