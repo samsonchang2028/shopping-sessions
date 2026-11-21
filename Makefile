@@ -1,3 +1,4 @@
+PY ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 IMAGE ?= shopping-sessions:latest
 CPUS  ?= 8
 MEM   ?= 24g
@@ -16,7 +17,7 @@ build:
 
 ## Run the image on all 36 edge-case fixtures and diff against the expected tables
 fixtures: build
-	python3 scripts/run_fixtures.py $(FIXTURES) -- scripts/docker_run.sh
+	$(PY) scripts/run_fixtures.py $(FIXTURES) -- scripts/docker_run.sh
 
 ## Make the 1M-event dev set with the published generator (needs `generate` on PATH)
 dev:
@@ -29,10 +30,9 @@ run-dev: build
 ## Compare your dev output with the published dev answer (dev-answer.zip, unzipped): make check-dev ANSWER=dev-answer
 ANSWER ?= dev-answer
 check-dev:
-	python3 scripts/compare.py out $(ANSWER)
+	$(PY) scripts/compare.py out $(ANSWER)
 
 ## ---- local harness (no Docker): unit tests, fixtures, fuzz, dev check
-PY ?= .venv/bin/python
 .PHONY: unit fixtures-local fixtures-ref fuzz check-local test-all
 unit:
 	$(PY) -m unittest discover -s tests
