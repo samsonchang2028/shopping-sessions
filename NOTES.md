@@ -105,6 +105,9 @@ with one memchr per field ~105 ns (memchr call overhead on ~90-byte lines domina
 exact date cache (was 83 ns each), product lookup 34 ns, price ~2 ns, record push ~0.
 
 ## Rejected ideas / why
+- More/smaller buckets so each bucket's tables fit this CPU's 256 KB L2 (dedup 256->1024, universe shards 256->1024,
+  person buckets 1024->4096): dedup 0.44 -> 0.36 s but parse, bucketing and the per-bucket stage got slower; net 2.65 -> 2.75 s
+  (dedup alone) or 3.3 s (all three). Reverted.
 - Rewriting quote validation as a line-level count while still using one memchr per comma: no gain (the per-call overhead
   was the cost, not the quote scan). The SSE2 64-byte block mask scanner is what helped (parse 1.15 -> 0.85 s).
 - mimalloc env knobs (MIMALLOC_LARGE_OS_PAGES, PURGE_DELAY): within noise (<2%).
