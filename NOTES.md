@@ -89,10 +89,11 @@ memory pressure (5.4 GB input, 16 GB RSS); not investigated yet.
 
 | native, SSE2 scanner + date cache (A/B, same load) | | 3.32 | | |
 | native, middle-bit dedup buckets | | 3.10 | | |
-| native, per-person-bucket pipeline + single-probe lookup (HEAD) | Docker 0.25 | 2.64 (Docker 2.95) | 11.6 | 5.0 GB / 13.8 GB |
+| native, per-person-bucket pipeline + single-probe lookup | Docker 0.25 | 2.64 (Docker 2.95) | 11.6 | 5.0 GB / 13.8 GB |
 
 NOTE: this laptop is shared (load average 5-8) and has 4 cores / 8 threads, so absolute timings drift by +-0.5 s between
 runs. Compare builds only with A/B runs alternated in the same minute (min of 5), e.g. a loop over two binaries.
+| native, SWAR ts + output tweaks + prefetched person-key table (HEAD) | Docker 0.25 | 2.40 (Docker 2.77) | 10.5 | 4.9 GB / 14.0 GB |
 
 20M native stages now (cumulative s): parse 1.15, dedup 1.75, clicks 2.0, universe 2.3 (0.3 s: shard 0.15, tables 0.08, prefix sort 0.04),
 components 2.4, events sorted 3.0, sessions+clicks sorted+credit+write 3.7. Biggest remaining: parse (about 1.1 s), events packed+sorted (0.65 s), dedup (0.6 s).
@@ -116,11 +117,14 @@ SWAR timestamps (8-byte validate+parse of HH:MM:SS and of 8 epoch-ms digits): pa
 
 ## Profiling (works without root)
 
-`perf` is blocked (perf_event_paranoid=4) but a SIGPROF sampler works: a scratch copy of `rust/` with `libc`, a signal handler that
+`python scripts/profile.py DATA_DIR` runs it. `perf` is blocked (perf_event_paranoid=4) but a SIGPROF sampler works: a scratch copy of `rust/` with `libc`, a signal handler that
 records RIP + the current stage, `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`, then `addr2line -i -C`. It showed the hot spots are
 memory-latency stalls on hash-table probes (shard tables total ~24 MB vs this CPU's 8 MB L3), not instruction counts.
 Fix that worked: one flat id-hash -> person-key table with batched `_mm_prefetch` lookups (16 at a time): bucket-by-person
 0.35 -> 0.18 s, 20M 2.58 -> 2.40 s (A/B). Same trick on the dedup table did NOT help (table is L3-resident): 2.40 -> 2.44 s, reverted.
+
+Remaining profile (20M, share of all CPU): parse 29% (13% of that is mimalloc page init for the 256 per-chunk bucket vecs),
+dedup 22% (hashbrown probe stalls), per-bucket sort/copy 15%, bucket-by-person 8%, clicks 7%, universe 10%, components 4%, write 4%.
 
 ## Rejected ideas / why
 - More/smaller buckets so each bucket's tables fit this CPU's 256 KB L2 (dedup 256->1024, universe shards 256->1024,
