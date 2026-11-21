@@ -87,10 +87,28 @@ clicks sorted by (person, ts, click_id bytes), credit by two-pointer merge, assi
 clicks sorted 0.4, credit+assists 0.1, write 0.1. 60M/20M = 4.0x (target <= 3.5x), parse is 4.3x: suspect page-cache and
 memory pressure (5.4 GB input, 16 GB RSS); not investigated yet.
 
+| native, SSE2 scanner + date cache (A/B, same load) | | 3.32 | | |
+| native, middle-bit dedup buckets | | 3.10 | | |
+| native, per-person-bucket pipeline + single-probe lookup (HEAD) | Docker 0.25 | 2.64 (Docker 2.95) | 11.6 | 5.0 GB / 13.8 GB |
+
+NOTE: this laptop is shared (load average 5-8) and has 4 cores / 8 threads, so absolute timings drift by +-0.5 s between
+runs. Compare builds only with A/B runs alternated in the same minute (min of 5), e.g. a loop over two binaries.
+
 20M native stages now (cumulative s): parse 1.15, dedup 1.75, clicks 2.0, universe 2.3 (0.3 s: shard 0.15, tables 0.08, prefix sort 0.04),
 components 2.4, events sorted 3.0, sessions+clicks sorted+credit+write 3.7. Biggest remaining: parse (about 1.1 s), events packed+sorted (0.65 s), dedup (0.6 s).
 
+Latest 20M stage times (s): parse 0.85, dedup 0.44, clicks 0.18, universe 0.28, components 0.14, bucket by person 0.31,
+per-bucket sort+sessions+credit+assists 0.34, write 0.12. 17 CPU-s user (was 23).
+
+Single-thread per-line costs measured with a scratch level benchmark (pre-scanner): newline scan 17 ns, comma splitting
+with one memchr per field ~105 ns (memchr call overhead on ~90-byte lines dominates), two timestamp parses 52 ns after the
+exact date cache (was 83 ns each), product lookup 34 ns, price ~2 ns, record push ~0.
+
 ## Rejected ideas / why
+- Rewriting quote validation as a line-level count while still using one memchr per comma: no gain (the per-call overhead
+  was the cost, not the quote scan). The SSE2 64-byte block mask scanner is what helped (parse 1.15 -> 0.85 s).
+- mimalloc env knobs (MIMALLOC_LARGE_OS_PAGES, PURGE_DELAY): within noise (<2%).
+- perf is installed but kernel.perf_event_paranoid=4 blocks sampling for non-root users, so profiling is manual.
 - Sorting IDs by comparing mmapped bytes: 0.66 s for 1.5M IDs (two cache misses per compare). 8-byte big-endian prefix + full compare on ties: 0.04 s.
 
 - Date-prefix lookup table for timestamps: in Rust exact days_from_civil + calendar checks cost about the same as a table
