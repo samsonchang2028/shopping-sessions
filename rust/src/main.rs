@@ -669,14 +669,13 @@ impl Acc {
     fn new(n: usize) -> Acc {
         Acc { sess: vec![0; n], purch: vec![0; n], rev: vec![0; n], asst: vec![0; n] }
     }
-    fn add(mut self, o: Acc) -> Acc {
+    fn add_assign(&mut self, o: &Acc) {
         for i in 0..self.sess.len() {
             self.sess[i] += o.sess[i];
             self.purch[i] += o.purch[i];
             self.rev[i] += o.rev[i];
             self.asst[i] += o.asst[i];
         }
-        self
     }
 }
 
@@ -687,6 +686,192 @@ fn json_str<'a>(j: &'a str, key: &str) -> Option<&'a str> {
     let a = rest.find('"')? + 1;
     let b = rest[a..].find('"')?;
     Some(&rest[a..a + b])
+}
+
+/// Per-thread scratch plus results for the bucketed per-person pipeline.
+struct Worker {
+    acc: Acc,
+    active: Vec<(i64, i64)>,
+    touched: Vec<u32>,
+    evs: Vec<E>,
+    cks: Vec<C>,
+    sess: Vec<Sess>,
+    catrev: Vec<u64>,
+    ctouched: Vec<u16>,
+    urows: Vec<UserRow>,
+}
+impl Worker {
+    fn new(cells: usize, ncamp: usize, ncat: usize) -> Worker {
+        Worker {
+            acc: Acc::new(cells),
+            active: vec![(i64::MIN, i64::MIN); ncamp],
+            touched: vec![],
+            evs: vec![],
+            cks: vec![],
+            sess: vec![],
+            catrev: vec![0; ncat],
+            ctouched: vec![],
+            urows: vec![],
+        }
+    }
+    fn merge(mut self, o: Worker) -> Worker {
+        self.acc.add_assign(&o.acc);
+        self.urows.extend(o.urows);
+        self
+    }
+}
+
+struct Geometry {
+    ws: i64,
+    ws_day: i64,
+    cws: i64,
+    ncamp: usize,
+    ndays: usize,
+}
+
+/// Everything for the persons of one bucket (a range of person keys): sort, sessions, user_daily rows,
+/// credit and assists. Buckets hold whole persons, so they are independent.
+fn run_bucket(w: &mut Worker, b: usize, evp: &[Vec<Vec<E>>], ckp: &[Vec<Vec<C>>], g: &Geometry) {
+    let Worker { acc, active, touched, evs, cks, sess, catrev, ctouched, urows } = w;
+    evs.clear();
+    for p in evp {
+        evs.extend_from_slice(&p[b]);
+    }
+    cks.clear();
+    for p in ckp {
+        cks.extend_from_slice(&p[b]);
+    }
+    evs.sort_unstable_by_key(|e| e.key);
+    cks.sort_unstable_by(|a, b| a.key.cmp(&b.key).then_with(|| id_of(a.id).cmp(id_of(b.id))));
+
+    // ---- sessions and user_daily rows
+    sess.clear();
+    let mut cur: Option<(u32, u16)> = None; // (person, day) group
+    let (mut g_sessions, mut g_events, mut g_rev) = (0u32, 0u64, 0u64);
+    let mut prev_key = 0u64;
+    let mut open = false;
+    macro_rules! flush {
+        () => {
+            if let Some((p, d)) = cur {
+                let mut top = u16::MAX;
+                let mut best = 0u64;
+                for &c in ctouched.iter() {
+                    let r = catrev[c as usize];
+                    if r > best || (r == best && r > 0 && c < top) {
+                        best = r;
+                        top = c;
+                    }
+                    catrev[c as usize] = 0;
+                }
+                ctouched.clear();
+                urows.push(UserRow { pk: p, day: d, sessions: g_sessions, events: g_events, rev: g_rev, top });
+                g_sessions = 0;
+                g_events = 0;
+                g_rev = 0;
+            }
+        };
+    }
+    for e in evs.iter() {
+        let p = (e.key >> 32) as u32;
+        let new = !open
+            || (e.key >> 32) != (prev_key >> 32)
+            || (e.key & 0xffff_ffff) - (prev_key & 0xffff_ffff) > GAP as u64;
+        if new {
+            let start = g.ws + (e.key & 0xffff_ffff) as i64;
+            let day = (start.div_euclid(DAY) - g.ws_day) as u16;
+            if cur != Some((p, day)) {
+                flush!();
+                cur = Some((p, day));
+            }
+            g_sessions += 1;
+            sess.push(Sess { pk: p, start, day, n: 0, rev: 0, has_p: false });
+            open = true;
+        }
+        prev_key = e.key;
+        let s = sess.last_mut().unwrap();
+        s.n += 1;
+        g_events += 1;
+        if e.purchase {
+            s.rev += e.price as u64;
+            s.has_p = true;
+            g_rev += e.price as u64;
+            if catrev[e.cat as usize] == 0 {
+                ctouched.push(e.cat);
+            }
+            catrev[e.cat as usize] += e.price as u64;
+        }
+    }
+    flush!();
+
+    // ---- credit and assists, person by person
+    let (ncamp, ndays, cws) = (g.ncamp, g.ndays, g.cws);
+    let (mut si, mut ci) = (0usize, 0usize);
+    while si < sess.len() {
+        let p = sess[si].pk;
+        let mut sj = si;
+        while sj < sess.len() && sess[sj].pk == p {
+            sj += 1;
+        }
+        while ci < cks.len() && ((cks[ci].key >> 32) as u32) < p {
+            ci += 1;
+        }
+        let mut cj = ci;
+        while cj < cks.len() && ((cks[cj].key >> 32) as u32) == p {
+            cj += 1;
+        }
+        let ss = &sess[si..sj];
+        let cs = &cks[ci..cj];
+        // credit: latest click at or before the start; ties keep the first (smallest click_id)
+        let mut c = 0usize;
+        let mut cand: Option<(i64, u32)> = None;
+        for s in ss {
+            while c < cs.len() && cws + (cs[c].key & 0xffff_ffff) as i64 <= s.start {
+                let t = cws + (cs[c].key & 0xffff_ffff) as i64;
+                if cand.map_or(true, |(ct, _)| t > ct) {
+                    cand = Some((t, cs[c].camp));
+                }
+                c += 1;
+            }
+            let camp = match cand {
+                Some((t, camp)) if s.start - t <= WEEK => camp as usize,
+                _ => ncamp,
+            };
+            let cell = camp * ndays + s.day as usize;
+            acc.sess[cell] += 1;
+            acc.purch[cell] += s.has_p as u32;
+            acc.rev[cell] += s.rev;
+        }
+        // assists: islands of clicks per campaign, each covering session starts in [first, last + 7d]
+        let emit = |camp: usize, first: i64, last: i64, acc: &mut Acc| {
+            let lo = ss.partition_point(|s| s.start < first);
+            let hi = ss.partition_point(|s| s.start <= last + WEEK);
+            for s in &ss[lo.min(hi)..hi] {
+                acc.asst[camp * ndays + s.day as usize] += 1;
+            }
+        };
+        for k in cs {
+            let t = cws + (k.key & 0xffff_ffff) as i64;
+            let cm = k.camp as usize;
+            let (f, l) = active[cm];
+            if f == i64::MIN {
+                active[cm] = (t, t);
+                touched.push(cm as u32);
+            } else if t - l > WEEK {
+                emit(cm, f, l, acc);
+                active[cm] = (t, t);
+            } else {
+                active[cm].1 = t;
+            }
+        }
+        for &cm in touched.iter() {
+            let (f, l) = active[cm as usize];
+            emit(cm as usize, f, l, acc);
+            active[cm as usize] = (i64::MIN, i64::MIN);
+        }
+        touched.clear();
+        si = sj;
+        ci = cj;
+    }
 }
 
 /// `ss --dump N DIR`: print the fields (hex; "-" for empty) of every well-formed N-field line of DIR/*.csv.
@@ -807,7 +992,7 @@ fn main() {
                     }
                 }
                 let cat = if ok { prod.get(f[5]).copied().unwrap_or(unknown_cat) } else { 0 };
-                buckets[(h >> 56) as usize].push(Ev {
+                buckets[((h >> 24) & 0xff) as usize].push(Ev {
                     h,
                     ing,
                     ts: if ok { (ts.unwrap() - ws) as u32 } else { 0 },
@@ -863,7 +1048,7 @@ fn main() {
                 let ts = parse_ts(f[3], &mut dc);
                 let camp = camp_idx.get(f[2]).copied();
                 let ok = !f[1].is_empty() && camp.is_some() && matches!(ts, Some(t) if t >= cws && t < we);
-                buckets[(h >> 56) as usize].push(Ck {
+                buckets[((h >> 24) & 0xff) as usize].push(Ck {
                     h,
                     ts: if ok { (ts.unwrap() - cws) as u32 } else { 0 },
                     line: Raw::of(line),
@@ -951,7 +1136,7 @@ fn main() {
         parts.push(lb);
     }
     lg.log("  universe: sharded");
-    let locals: Vec<(Vec<Raw>, IdMap<(u32, u32)>)> = (0..NBU)
+    let mut locals: Vec<(Vec<Raw>, IdMap<(u32, u32)>)> = (0..NBU)
         .into_par_iter()
         .map(|u| {
             let mut map: IdMap<(u32, u32)> = IdMap::default();
@@ -1032,190 +1217,68 @@ fn main() {
         }
     }
     let pk: Vec<u32> = (0..n as u32).map(|i| find(&mut parent, i)).collect();
+    // One probe per lookup from here on: replace each shard entry's local index with the final person key.
+    locals.par_iter_mut().enumerate().for_each(|(u, (_, map))| {
+        for v in map.values_mut() {
+            v.1 = pk[rank[(base[u] + v.1) as usize] as usize];
+        }
+    });
+    let id_pk = |uh: u64| -> u32 { locals[shard(uh)].1[&uh].1 };
     lg.log("components");
 
-    // ---- packed events, one parallel sort
-    let mut evs: Vec<E> = ev_surv
+    // ---- bucket events and clicks by person range, then do each bucket's work independently in parallel
+    const NBK: usize = 1024;
+    let nn = (n as u64).max(1);
+    let bucket_of = |p: u32| ((p as u64 * NBK as u64) / nn) as usize;
+    let evp: Vec<Vec<Vec<E>>> = ev_surv
         .par_iter()
-        .flat_map_iter(|v| {
-            v.iter().map(|e| E {
-                key: ((pk[id_idx(e.uh)] as u64) << 32) | e.ts as u64,
-                price: e.price,
-                cat: e.cat,
-                purchase: e.purchase,
-            })
+        .map(|v| {
+            let est = v.len() / NBK + v.len() / NBK / 4 + 8;
+            let mut lb: Vec<Vec<E>> = (0..NBK).map(|_| Vec::with_capacity(est)).collect();
+            for e in v {
+                let p = id_pk(e.uh);
+                lb[bucket_of(p)].push(E {
+                    key: ((p as u64) << 32) | e.ts as u64,
+                    price: e.price,
+                    cat: e.cat,
+                    purchase: e.purchase,
+                });
+            }
+            lb
         })
         .collect();
     drop(ev_surv);
-    evs.par_sort_unstable_by_key(|e| e.key);
-    lg.log(&format!("events sorted: {}", evs.len()));
-
-    // ---- sessions and user_daily in one sequential pass
-    let ncat = cat_names.len();
-    let mut sess: Vec<Sess> = Vec::new();
-    let mut urows: Vec<UserRow> = Vec::new();
-    {
-        let mut catrev = vec![0u64; ncat];
-        let mut touched: Vec<u16> = vec![];
-        let mut cur: Option<(u32, u16)> = None; // (person, day) group
-        let (mut g_sessions, mut g_events, mut g_rev) = (0u32, 0u64, 0u64);
-        let mut prev_key = 0u64;
-        let mut open = false;
-        macro_rules! flush {
-            () => {
-                if let Some((p, d)) = cur {
-                    let mut top = u16::MAX;
-                    let mut best = 0u64;
-                    for &c in &touched {
-                        let r = catrev[c as usize];
-                        if r > best || (r == best && r > 0 && c < top) {
-                            best = r;
-                            top = c;
-                        }
-                        catrev[c as usize] = 0;
-                    }
-                    touched.clear();
-                    urows.push(UserRow { pk: p, day: d, sessions: g_sessions, events: g_events, rev: g_rev, top });
-                    g_sessions = 0;
-                    g_events = 0;
-                    g_rev = 0;
-                }
-            };
-        }
-        for e in &evs {
-            let p = (e.key >> 32) as u32;
-            let new = !open || (e.key >> 32) != (prev_key >> 32) || (e.key & 0xffff_ffff) - (prev_key & 0xffff_ffff) > GAP as u64;
-            if new {
-                let start = ws + (e.key & 0xffff_ffff) as i64;
-                let day = (start.div_euclid(DAY) - ws_day) as u16;
-                if cur != Some((p, day)) {
-                    flush!();
-                    cur = Some((p, day));
-                }
-                g_sessions += 1;
-                sess.push(Sess { pk: p, start, day, n: 0, rev: 0, has_p: false });
-                open = true;
-            }
-            prev_key = e.key;
-            let s = sess.last_mut().unwrap();
-            s.n += 1;
-            g_events += 1;
-            if e.purchase {
-                s.rev += e.price as u64;
-                s.has_p = true;
-                g_rev += e.price as u64;
-                if catrev[e.cat as usize] == 0 {
-                    touched.push(e.cat);
-                }
-                catrev[e.cat as usize] += e.price as u64;
-            }
-        }
-        flush!();
-    }
-    drop(evs);
-    lg.log(&format!("sessions: {}, user_daily rows: {}", sess.len(), urows.len()));
-
-    // ---- clicks packed + sorted by (person, ts, click_id bytes)
-    let mut cks: Vec<C> = ck_surv
+    let ckp: Vec<Vec<Vec<C>>> = ck_surv
         .par_iter()
-        .flat_map_iter(|v| {
-            v.iter().map(|c| C {
-                key: ((pk[id_idx(c.uh)] as u64) << 32) | c.ts as u64,
-                camp: c.camp,
-                id: c.line,
-            })
+        .map(|v| {
+            let est = v.len() / NBK + v.len() / NBK / 4 + 8;
+            let mut lb: Vec<Vec<C>> = (0..NBK).map(|_| Vec::with_capacity(est)).collect();
+            for c in v {
+                let p = id_pk(c.uh);
+                lb[bucket_of(p)].push(C { key: ((p as u64) << 32) | c.ts as u64, camp: c.camp, id: c.line });
+            }
+            lb
         })
         .collect();
     drop(ck_surv);
-    cks.par_sort_unstable_by(|a, b| a.key.cmp(&b.key).then_with(|| id_of(a.id).cmp(id_of(b.id))));
-    lg.log("clicks sorted");
+    lg.log("events and clicks bucketed by person");
 
-    // ---- credit + assists per person
-    let mut tasks: Vec<(usize, usize, usize, usize)> = vec![]; // (sess lo, hi, click lo, hi)
-    {
-        let (mut si, mut ci) = (0usize, 0usize);
-        while si < sess.len() {
-            let p = sess[si].pk;
-            let mut sj = si;
-            while sj < sess.len() && sess[sj].pk == p {
-                sj += 1;
-            }
-            while ci < cks.len() && ((cks[ci].key >> 32) as u32) < p {
-                ci += 1;
-            }
-            let mut cj = ci;
-            while cj < cks.len() && ((cks[cj].key >> 32) as u32) == p {
-                cj += 1;
-            }
-            tasks.push((si, sj, ci, cj));
-            si = sj;
-            ci = cj;
-        }
-    }
+    let ncat = cat_names.len();
     let cells = (ncamp + 1) * ndays;
-    let acc = tasks
-        .par_chunks(256)
+    let geo = Geometry { ws, ws_day, cws, ncamp, ndays };
+    let Worker { acc, urows, .. } = (0..NBK)
+        .into_par_iter()
         .fold(
-            || (Acc::new(cells), vec![(i64::MIN, i64::MIN); ncamp], Vec::<u32>::new()),
-            |(mut acc, mut active, mut touched), chunk| {
-                for &(slo, shi, clo, chi) in chunk {
-                    let ss = &sess[slo..shi];
-                    let cs = &cks[clo..chi];
-                    // credit: latest click at or before the start; ties keep the first (smallest click_id)
-                    let mut c = 0usize;
-                    let mut cand: Option<(i64, u32)> = None;
-                    for s in ss {
-                        while c < cs.len() && cws + (cs[c].key & 0xffff_ffff) as i64 <= s.start {
-                            let t = cws + (cs[c].key & 0xffff_ffff) as i64;
-                            if cand.map_or(true, |(ct, _)| t > ct) {
-                                cand = Some((t, cs[c].camp));
-                            }
-                            c += 1;
-                        }
-                        let camp = match cand {
-                            Some((t, camp)) if s.start - t <= WEEK => camp as usize,
-                            _ => ncamp,
-                        };
-                        let cell = camp * ndays + s.day as usize;
-                        acc.sess[cell] += 1;
-                        acc.purch[cell] += s.has_p as u32;
-                        acc.rev[cell] += s.rev;
-                    }
-                    // assists: islands of clicks per campaign, each covering session starts in [first, last + 7d]
-                    let mut emit = |camp: usize, first: i64, last: i64, acc: &mut Acc| {
-                        let lo = ss.partition_point(|s| s.start < first);
-                        let hi = ss.partition_point(|s| s.start <= last + WEEK);
-                        for s in &ss[lo.min(hi)..hi] {
-                            acc.asst[camp * ndays + s.day as usize] += 1;
-                        }
-                    };
-                    for k in cs {
-                        let t = cws + (k.key & 0xffff_ffff) as i64;
-                        let cm = k.camp as usize;
-                        let (f, l) = active[cm];
-                        if f == i64::MIN {
-                            active[cm] = (t, t);
-                            touched.push(cm as u32);
-                        } else if t - l > WEEK {
-                            emit(cm, f, l, &mut acc);
-                            active[cm] = (t, t);
-                        } else {
-                            active[cm].1 = t;
-                        }
-                    }
-                    for &cm in &touched {
-                        let (f, l) = active[cm as usize];
-                        emit(cm as usize, f, l, &mut acc);
-                        active[cm as usize] = (i64::MIN, i64::MIN);
-                    }
-                    touched.clear();
-                }
-                (acc, active, touched)
+            || Worker::new(cells, ncamp, ncat),
+            |mut w, b| {
+                run_bucket(&mut w, b, &evp, &ckp, &geo);
+                w
             },
         )
-        .map(|(a, _, _)| a)
-        .reduce(|| Acc::new(cells), |a, b| a.add(b));
-    lg.log("credit + assists");
+        .reduce(|| Worker::new(cells, ncamp, ncat), |a, b| a.merge(b));
+    drop(evp);
+    drop(ckp);
+    lg.log(&format!("sessions, credit, assists: user_daily rows {}", urows.len()));
 
     // ---- output
     std::fs::create_dir_all(out.join("user_daily")).expect("output dir");
