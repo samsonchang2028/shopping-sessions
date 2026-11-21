@@ -1,0 +1,20 @@
+# data: never committed
+dev/
+dev-answer*/
+dev-answer*
+data/
+gen/
+bench/
+fuzz-data/
+out/
+output/
+scratch/
+*.csv.gz
+*.parquet
+*.zip
+# build / env
+generator/
+target/
+__pycache__/
+.venv/
+*.pyc
