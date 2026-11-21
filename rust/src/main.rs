@@ -38,9 +38,17 @@ type FMap<K, V> = HashMap<K, V, FixedState>;
 type FSet<K> = HashSet<K, FixedState>;
 
 struct Logger(Instant);
+/// User+system CPU seconds of this process so far (from /proc/self/stat, 100 ticks per second).
+fn cpu_secs() -> f64 {
+    let st = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let rest = st.rsplit(')').next().unwrap_or("");
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let t = |i: usize| f.get(i).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+    (t(11) + t(12)) / 100.0
+}
 impl Logger {
     fn log(&self, what: &str) {
-        eprintln!("[{:7.3}s] {}", self.0.elapsed().as_secs_f64(), what);
+        eprintln!("[{:7.3}s cpu {:6.2}] {}", self.0.elapsed().as_secs_f64(), cpu_secs(), what);
     }
 }
 
@@ -991,7 +999,8 @@ fn main() {
                         None => ok = false,
                     }
                 }
-                let cat = if ok { prod.get(f[5]).copied().unwrap_or(unknown_cat) } else { 0 };
+                // the category is only used for purchase revenue; views and carts (97%) skip the lookup
+                let cat = if ok && purchase { prod.get(f[5]).copied().unwrap_or(unknown_cat) } else { 0 };
                 buckets[((h >> 24) & 0xff) as usize].push(Ev {
                     h,
                     ing,

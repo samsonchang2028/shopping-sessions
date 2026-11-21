@@ -104,6 +104,12 @@ Single-thread per-line costs measured with a scratch level benchmark (pre-scanne
 with one memchr per field ~105 ns (memchr call overhead on ~90-byte lines dominates), two timestamp parses 52 ns after the
 exact date cache (was 83 ns each), product lookup 34 ns, price ~2 ns, record push ~0.
 
+CPU per stage at 20M (cumulative user+sys CPU-s, logged by `ss`): events parse 5.6, dedup +2.9, clicks +1.2, universe +1.6,
+components +0.2, bucket by person +2.3, per-bucket work +2.4, write +0.9, total about 17. The run is CPU-bound (about 6.7 busy
+threads); this laptop has 4 cores / 8 threads so each thread runs at roughly half speed. Category lookup now only for
+purchases (parse CPU 6.4 -> 5.6 s, wall 2.68 -> 2.55 s A/B). Estimated remaining headroom without a redesign: ~0.3 s
+(SWAR timestamps, merged user hash, front cache for products). Sub-second at 20M needs ~2.5x less total work.
+
 ## Rejected ideas / why
 - More/smaller buckets so each bucket's tables fit this CPU's 256 KB L2 (dedup 256->1024, universe shards 256->1024,
   person buckets 1024->4096): dedup 0.44 -> 0.36 s but parse, bucketing and the per-bucket stage got slower; net 2.65 -> 2.75 s
