@@ -70,6 +70,33 @@ class Grammar(unittest.TestCase):
                 self.fail("fast reader refused input without \\r")
             return got
 
+    def check_rust(self, arity, seed, with_cr=False):
+        """The native scanner (`ss --dump`) must accept exactly the lines the reference accepts, with equal fields."""
+        binary = os.path.join(HERE, "..", "rust", "target", "release", "ss")
+        if not os.path.exists(binary):
+            self.skipTest("native binary not built")
+        import subprocess
+        rng = random.Random(seed)
+        with tempfile.TemporaryDirectory() as d:
+            for fi in range(3):
+                lines = ["h" + ",h" * (arity - 1)] + [rand_line(rng, arity) for _ in range(2000)]
+                if with_cr:
+                    lines = [ln + ("\r" if rng.random() < 0.1 else "") for ln in lines]
+                text = "\n".join(lines) + ("\n" if fi != 1 else "")
+                with open(os.path.join(d, f"p{fi}.csv"), "w", encoding="utf-8", newline="") as f:
+                    f.write(text)
+            want = collections.Counter(
+                " ".join("-" if v is None else v.hex() for v in row) for row in reference.read_family(d, arity))
+            out = subprocess.run([binary, "--dump", str(arity), d], capture_output=True, text=True, check=True).stdout
+            got = collections.Counter(out.splitlines())
+            self.assertEqual(got, want)
+
+    def test_native_scanner(self):
+        for arity in (2, 4, 7):
+            for seed in range(6):
+                self.check_rust(arity, 400 + seed)
+        self.check_rust(4, 500, with_cr=True)
+
     def test_arity_7(self):
         for seed in range(4):
             self.check(7, seed)

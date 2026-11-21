@@ -117,25 +117,155 @@ fn field(f: &[u8]) -> Option<&[u8]> {
     }
 }
 
-/// Split a line into exactly N well-formed fields.
+/// Split a line into exactly N well-formed fields (unquoted; empty means null).
+/// Quote rule without per-field scans: a field is "quoted" if it starts with a quote; it must also end with one
+/// (length >= 2). The line is well formed iff its total quote count is exactly 2 per quoted field: every quoted
+/// field then has no inner quote and every other field has none at all.
 #[inline]
 fn split<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     let mut out: [&[u8]; N] = [&line[0..0]; N];
     let mut s = 0;
     let mut i = 0;
+    let mut quoted = 0usize;
     for p in memchr_iter(b',', line) {
         if i == N - 1 {
             return None;
         }
-        out[i] = field(&line[s..p])?;
+        let f = &line[s..p];
+        out[i] = if !f.is_empty() && f[0] == b'"' {
+            if f.len() < 2 || f[f.len() - 1] != b'"' {
+                return None;
+            }
+            quoted += 1;
+            &f[1..f.len() - 1]
+        } else {
+            f
+        };
         i += 1;
         s = p + 1;
     }
     if i != N - 1 {
         return None;
     }
-    out[i] = field(&line[s..])?;
+    let f = &line[s..];
+    out[i] = if !f.is_empty() && f[0] == b'"' {
+        if f.len() < 2 || f[f.len() - 1] != b'"' {
+            return None;
+        }
+        quoted += 1;
+        &f[1..f.len() - 1]
+    } else {
+        f
+    };
+    let q = line.iter().filter(|&&c| c == b'"').count();
+    if q != 2 * quoted {
+        return None;
+    }
     Some(out)
+}
+
+/// Scan every line of `b` (a run of whole lines) and call `f(line, fields)` for each line that is well formed under
+/// the dialect: exactly N fields, quotes only around whole fields. Fields come unquoted; empty means null.
+///
+/// x86-64: one SSE2 pass builds comma / newline / quote bitmasks for each 64-byte block and walks the set bits, so
+/// a line costs a few bit operations instead of one memchr call per field. A line's quote check is a popcount
+/// difference: its total quote count must be exactly 2 per field that starts with a quote.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn scan<const N: usize>(b: &[u8], mut f: impl FnMut(&[u8], [&[u8]; N])) {
+    use std::arch::x86_64::*;
+    let len = b.len();
+    let mut line_start = 0usize;
+    let mut q_start = 0u64;
+    let mut qcum = 0u64; // quote bytes in all blocks before the current one
+    let mut ends = [0usize; N];
+    let mut ncomma = 0usize;
+    let mut tail = [0u8; 64];
+    let mut o = 0usize;
+    // Finish a line ending at absolute position `pos` with `q_end` quote bytes before it.
+    macro_rules! finish {
+        ($pos:expr, $q_end:expr) => {{
+            let pos: usize = $pos;
+            if ncomma == N - 1 {
+                let mut out: [&[u8]; N] = [&b[0..0]; N];
+                let mut quoted = 0u64;
+                let mut ok = true;
+                let mut st = line_start;
+                for i in 0..N {
+                    let en = if i < N - 1 { ends[i] } else { pos };
+                    let fl = &b[st..en];
+                    out[i] = if !fl.is_empty() && fl[0] == b'"' {
+                        if fl.len() < 2 || fl[fl.len() - 1] != b'"' {
+                            ok = false;
+                            break;
+                        }
+                        quoted += 1;
+                        &fl[1..fl.len() - 1]
+                    } else {
+                        fl
+                    };
+                    st = en + 1;
+                }
+                if ok && ($q_end) - q_start == 2 * quoted {
+                    f(&b[line_start..pos], out);
+                }
+            }
+            line_start = pos + 1;
+            q_start = $q_end;
+            ncomma = 0;
+        }};
+    }
+    while o < len {
+        let (mc, mn, mq) = unsafe {
+            let (pc, valid) = if o + 64 <= len {
+                (b.as_ptr().add(o), 64)
+            } else {
+                let n = len - o;
+                tail[..n].copy_from_slice(&b[o..]);
+                tail[n..].fill(0);
+                (tail.as_ptr(), n)
+            };
+            let _ = valid;
+            let (vc, vn, vq) = (_mm_set1_epi8(b',' as i8), _mm_set1_epi8(b'\n' as i8), _mm_set1_epi8(b'"' as i8));
+            let (mut mc, mut mn, mut mq) = (0u64, 0u64, 0u64);
+            for i in 0..4 {
+                let v = _mm_loadu_si128(pc.add(16 * i) as *const __m128i);
+                mc |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, vc)) as u16 as u64) << (16 * i);
+                mn |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, vn)) as u16 as u64) << (16 * i);
+                mq |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, vq)) as u16 as u64) << (16 * i);
+            }
+            (mc, mn, mq)
+        };
+        let mut m = mc | mn;
+        while m != 0 {
+            let t = m.trailing_zeros();
+            m &= m - 1;
+            let pos = o + t as usize;
+            if (mn >> t) & 1 == 1 {
+                let q_end = qcum + (mq & ((1u64 << t) - 1)).count_ones() as u64;
+                finish!(pos, q_end);
+            } else {
+                if ncomma < N - 1 {
+                    ends[ncomma] = pos;
+                }
+                ncomma += 1;
+            }
+        }
+        qcum += mq.count_ones() as u64;
+        o += 64;
+    }
+    if line_start < len {
+        finish!(len, qcum);
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn scan<const N: usize>(b: &[u8], mut f: impl FnMut(&[u8], [&[u8]; N])) {
+    for_lines(b, |line| {
+        if let Some(fl) = split::<N>(line) {
+            f(line, fl);
+        }
+    });
 }
 
 fn for_lines(b: &[u8], mut f: impl FnMut(&[u8])) {
@@ -167,81 +297,115 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 
 #[inline]
 fn d2(s: &[u8], i: usize) -> Option<i64> {
-    let (a, b) = (s[i], s[i + 1]);
-    if a.is_ascii_digit() && b.is_ascii_digit() {
-        Some(((a - b'0') * 10 + (b - b'0')) as i64)
+    let (a, b) = (s[i].wrapping_sub(b'0'), s[i + 1].wrapping_sub(b'0'));
+    if a < 10 && b < 10 {
+        Some((a * 10 + b) as i64)
     } else {
         None
     }
 }
 
-/// rules.md "Timestamps": F1, F2, F3 to epoch ms UTC, or None. Digits are ASCII only.
-fn parse_ts(s: &[u8]) -> Option<i64> {
-    let n = s.len();
-    if n == 0 {
-        return None;
-    }
-    if s.iter().all(|c| c.is_ascii_digit()) {
-        let mut i = 0;
-        while i < n && s[i] == b'0' {
-            i += 1;
-        }
-        if n - i > 15 {
-            return None;
-        }
-        let mut v: i64 = 0;
-        for &c in &s[i..] {
-            v = v * 10 + (c - b'0') as i64;
-        }
-        return Some(v);
-    }
-    if n != 20 && n != 25 {
-        return None;
-    }
-    if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+/// Days since the epoch of an exact "YYYY-MM-DD" (10 bytes), None if it is not a real calendar date.
+fn date_days(s: &[u8]) -> Option<i64> {
+    if s[4] != b'-' || s[7] != b'-' {
         return None;
     }
     let y = d2(s, 0)? * 100 + d2(s, 2)?;
-    let (mo, d, h, mi, se) = (d2(s, 5)?, d2(s, 8)?, d2(s, 11)?, d2(s, 14)?, d2(s, 17)?);
-    let off = if n == 20 {
-        if s[19] != b'Z' {
-            return None;
-        }
-        0
-    } else {
-        let sign = match s[19] {
-            b'+' => 1,
-            b'-' => -1,
-            _ => return None,
-        };
-        if s[22] != b':' {
-            return None;
-        }
-        let (oh, om) = (d2(s, 20)?, d2(s, 23)?);
-        if oh > 23 || om > 59 {
-            return None;
-        }
-        sign * (oh * 3_600_000 + om * 60_000)
-    };
-    if !(1..=12).contains(&mo) || h > 23 || mi > 59 || se > 59 || d < 1 {
+    let (mo, d) = (d2(s, 5)?, d2(s, 8)?);
+    if !(1..=12).contains(&mo) || d < 1 {
         return None;
     }
     let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
     let dim = match mo {
-        2 => {
-            if leap {
-                29
-            } else {
-                28
-            }
-        }
+        2 => 28 + leap as i64,
         4 | 6 | 9 | 11 => 30,
         _ => 31,
     };
     if d > dim {
         return None;
     }
-    Some((((days_from_civil(y, mo, d) * 24 + h) * 60 + mi) * 60 + se) * 1000 - off)
+    Some(days_from_civil(y, mo, d))
+}
+
+/// Per-thread memo of date prefix -> day number. Every entry is computed by `date_days` from the exact 10 bytes
+/// (invalid dates are cached as invalid), so the cache can only repeat what the exact function says.
+struct DateCache {
+    ent: [(u64, u16, i64); 128], // (first 8 bytes, next 2 bytes, days or i64::MIN for "not a date"); (0,0,_) = empty
+}
+impl DateCache {
+    fn new() -> DateCache {
+        DateCache { ent: [(0, 0, 0); 128] }
+    }
+    #[inline]
+    fn days(&mut self, s: &[u8]) -> Option<i64> {
+        let a = u64::from_le_bytes(s[0..8].try_into().unwrap());
+        let b = u16::from_le_bytes(s[8..10].try_into().unwrap());
+        let slot = ((a.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 57) as usize) & 127;
+        let e = &mut self.ent[slot];
+        if e.0 == a && e.1 == b {
+            return if e.2 == i64::MIN { None } else { Some(e.2) };
+        }
+        let r = date_days(s);
+        *e = (a, b, r.unwrap_or(i64::MIN));
+        r
+    }
+}
+
+/// rules.md "Timestamps": F1, F2, F3 to epoch ms UTC, or None. Digits are ASCII only.
+#[inline]
+fn parse_ts(s: &[u8], dc: &mut DateCache) -> Option<i64> {
+    let n = s.len();
+    if (n == 20 || n == 25) && s[4] == b'-' {
+        let days = dc.days(s)?;
+        if s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+            return None;
+        }
+        let (h, mi, se) = (d2(s, 11)?, d2(s, 14)?, d2(s, 17)?);
+        if h > 23 || mi > 59 || se > 59 {
+            return None;
+        }
+        let off = if n == 20 {
+            if s[19] != b'Z' {
+                return None;
+            }
+            0
+        } else {
+            let sign = match s[19] {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            if s[22] != b':' {
+                return None;
+            }
+            let (oh, om) = (d2(s, 20)?, d2(s, 23)?);
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            sign * (oh * 3_600_000 + om * 60_000)
+        };
+        return Some((((days * 24 + h) * 60 + mi) * 60 + se) * 1000 - off);
+    }
+    // F3: ASCII digits only, at most 15 significant digits (more is outside any window), leading zeros fine.
+    if n == 0 {
+        return None;
+    }
+    let mut v: i64 = 0;
+    let mut sig = 0;
+    for &c in s {
+        let d = c.wrapping_sub(b'0');
+        if d > 9 {
+            return None;
+        }
+        if v > 0 || d > 0 {
+            sig += 1;
+            if sig > 15 {
+                return None;
+            }
+        }
+        v = v * 10 + d as i64;
+    }
+    Some(v)
 }
 
 /// purchase price: ASCII digits, value 1..=10,000,000 (leading zeros fine).
@@ -525,7 +689,35 @@ fn json_str<'a>(j: &'a str, key: &str) -> Option<&'a str> {
     Some(&rest[a..a + b])
 }
 
+/// `ss --dump N DIR`: print the fields (hex; "-" for empty) of every well-formed N-field line of DIR/*.csv.
+/// Used by tests/test_csv_grammar.py to compare this scanner with the reference parser.
+fn dump(n: usize, dir: &Path) {
+    let files = map_files(dir);
+    let cs = chunks(&files);
+    let hex = |f: &[u8]| if f.is_empty() { "-".to_string() } else { f.iter().map(|b| format!("{b:02x}")).collect::<String>() };
+    macro_rules! go {
+        ($n:literal) => {
+            for c in &cs {
+                scan::<$n>(&files[c.file][c.start..c.end], |_, f| {
+                    println!("{}", f.iter().map(|x| hex(x)).collect::<Vec<_>>().join(" "));
+                });
+            }
+        };
+    }
+    match n {
+        2 => go!(2),
+        4 => go!(4),
+        7 => go!(7),
+        _ => panic!("arity 2, 4 or 7"),
+    }
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 4 && args[1] == "--dump" {
+        dump(args[2].parse().unwrap(), Path::new(&args[3]));
+        return;
+    }
     let lg = Logger(Instant::now());
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
@@ -533,8 +725,9 @@ fn main() {
     rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global().unwrap();
 
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
-    let ws = parse_ts(json_str(&manifest, "window_start").expect("window_start").as_bytes()).expect("window_start");
-    let we = parse_ts(json_str(&manifest, "window_end").expect("window_end").as_bytes()).expect("window_end");
+    let mut dc0 = DateCache::new();
+    let ws = parse_ts(json_str(&manifest, "window_start").expect("window_start").as_bytes(), &mut dc0).expect("window_start");
+    let we = parse_ts(json_str(&manifest, "window_end").expect("window_end").as_bytes(), &mut dc0).expect("window_end");
     let cws = ws - WEEK;
     if we <= ws || we - cws >= (1 << 32) || ws < 0 {
         decline("window too long or malformed for packed keys");
@@ -585,21 +778,21 @@ fn main() {
         .par_iter()
         .map(|c| {
             let b = &ev_files[c.file][c.start..c.end];
+            let mut dc = DateCache::new();
             let est = b.len() / 80 / NB + 8;
             let mut buckets: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::with_capacity(est)).collect();
-            for_lines(b, |line| {
-                let Some(f) = split::<7>(line) else { return };
+            scan::<7>(b, |line, f| {
                 if f[0].is_empty() {
                     return;
                 }
                 let h = hash_bytes(f[0]);
                 let (uh, uk) = if f[1].is_empty() { (0, 0) } else { uhash(f[1]) };
-                let ing = match parse_ts(f[3]) {
+                let ing = match parse_ts(f[3], &mut dc) {
                     None => u32::MAX,
                     Some(ms) if ms >= 0 && ms % 1000 == 0 && ms / 1000 < u32::MAX as i64 => (ms / 1000) as u32,
                     Some(_) => decline("ingest_ts is not whole seconds in 1970..2106"),
                 };
-                let ts = parse_ts(f[2]);
+                let ts = parse_ts(f[2], &mut dc);
                 let ty = f[4];
                 let purchase = ty == b"purchase";
                 let mut ok = !f[1].is_empty()
@@ -658,16 +851,16 @@ fn main() {
         .par_iter()
         .map(|c| {
             let b = &ck_files[c.file][c.start..c.end];
+            let mut dc = DateCache::new();
             let est = b.len() / 50 / NB + 8;
             let mut buckets: Vec<Vec<Ck>> = (0..NB).map(|_| Vec::with_capacity(est)).collect();
-            for_lines(b, |line| {
-                let Some(f) = split::<4>(line) else { return };
+            scan::<4>(b, |line, f| {
                 if f[0].is_empty() {
                     return;
                 }
                 let h = hash_bytes(f[0]);
                 let (uh, uk) = if f[1].is_empty() { (0, 0) } else { uhash(f[1]) };
-                let ts = parse_ts(f[3]);
+                let ts = parse_ts(f[3], &mut dc);
                 let camp = camp_idx.get(f[2]).copied();
                 let ok = !f[1].is_empty() && camp.is_some() && matches!(ts, Some(t) if t >= cws && t < we);
                 buckets[(h >> 56) as usize].push(Ck {
@@ -708,12 +901,10 @@ fn main() {
         .flat_map_iter(|c| {
             let b = &lk_files[c.file][c.start..c.end];
             let mut v = vec![];
-            for_lines(b, |line| {
-                if let Some([a, bb]) = split::<2>(line) {
-                    if !a.is_empty() && !bb.is_empty() {
-                        let ((ha, ka), (hb, kb)) = (uhash(a), uhash(bb));
-                        v.push((ha, ka, Raw::of(a), hb, kb, Raw::of(bb)));
-                    }
+            scan::<2>(b, |_, [a, bb]| {
+                if !a.is_empty() && !bb.is_empty() {
+                    let ((ha, ka), (hb, kb)) = (uhash(a), uhash(bb));
+                    v.push((ha, ka, Raw::of(a), hb, kb, Raw::of(bb)));
                 }
             });
             v
