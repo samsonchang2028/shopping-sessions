@@ -58,14 +58,37 @@ sessions -> F credit: click points collapsed per `(pk, ts)` with `arg_min(campai
 G assists: islands per `(pk, campaign)` (gap > 7 d starts a new island), lo/hi session via two ASOF joins, unnest range ->
 H outputs as snappy Parquet, `day` DATE.
 
-## Benchmarks
+## Engines
 
-Local box: 8 vCPU, 30 GB. Times are wall seconds.
+- **native (default)**: `rust/src/main.rs`, binary `/app/ss`. Whole pipeline, writes Parquet itself. Exit code 3 means the
+  dataset is outside its limits (window + 7 d >= 2^32 ms, campaigns x days > 100M cells, too many ids); `run.sh` then runs
+  the DuckDB engine. Any other nonzero exit is a failure (no silent fallback). `ENGINE=duckdb` forces the DuckDB engine.
+- **duckdb**: `pipeline/pipeline.py`. Slower, independent implementation; kept as fallback and as a third opinion in `make fuzz`
+  (fuzz diffs BOTH engines against `ref/reference.py`).
 
-| Version | 1M local | 1M docker | 20M | 60M |
+Native design: mmap, chunk files at line boundaries (8 MB), own exact line grammar, records hash-partitioned into 256
+buckets by event_id hash (dedup = sort by (hash, ingest), exact id comparison inside equal-hash groups, so collisions are
+safe), user IDs hashed once and sharded into 256 cache-sized sets, byte-sorted universe, union-find with min-index root,
+events packed as `person << 32 | (ts - ws)` and sorted once in parallel, one sequential pass makes sessions and user_daily,
+clicks sorted by (person, ts, click_id bytes), credit by two-pointer merge, assists by per-(person, campaign) islands.
+
+## Benchmarks (local, 8 threads, wall seconds)
+
+| Version | 1M | 20M | 60M | peak RSS 20M / 60M |
 | --- | --- | --- | --- | --- |
-| 4802b50 first correct | 4.39 | 4.50 | | |
+| duckdb engine, first correct | 4.4 | 65.6 | | 11.5 GB / |
+| duckdb engine, sentinel reader | 4.4 | 38.8 | | 8.5 GB / |
+| native, first | 0.35 (Docker 0.57) | 9.0 | | 5.1 GB / |
+| native, sharded interning, thin LTO (c10acc5 + this) | Docker 0.26 | 6.3 (Docker 6.5) | 25.2 | 5.9 GB / 16.3 GB |
+
+20M native stages: parse 1.2, dedup 1.0, clicks 0.3, universe 1.4, components 0.3, pack+sort events 1.3, sessions 0.2,
+clicks sorted 0.4, credit+assists 0.1, write 0.1. 60M/20M = 4.0x (target <= 3.5x), parse is 4.3x: suspect page-cache and
+memory pressure (5.4 GB input, 16 GB RSS); not investigated yet.
 
 ## Rejected ideas / why
 
-(none yet)
+- Date-prefix lookup table for timestamps: in Rust exact days_from_civil + calendar checks cost about the same as a table
+  lookup and cannot be wrong about leap years, so the table adds risk for no gain.
+- DuckDB regexp_extract with 14 capture groups for fields: 11 s vs 5.3 s for fullmatch+split at 20M.
+- scipy connected_components: replaced by union-find in the native engine (no Python at all on the fast path).
+- fat LTO + 1 codegen unit: Docker build 5m14s vs 56s with thin LTO and 16 units, identical run time.

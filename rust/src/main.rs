@@ -304,6 +304,7 @@ struct Ev {
     ts: i64,
     id: Raw,
     user: Raw,
+    uh: u64,
     price: u32,
     cat: u16,
     ok: bool,
@@ -316,6 +317,7 @@ struct Ck {
     ts: i64,
     id: Raw,
     user: Raw,
+    uh: u64,
     camp: u32,
 }
 
@@ -516,6 +518,7 @@ fn main() {
                     ts: ts.unwrap_or(0),
                     id: Raw::of(f[0]),
                     user: Raw::of(f[1]),
+                    uh: if f[1].is_empty() { 0 } else { hash_bytes(f[1]) },
                     price,
                     cat,
                     ok,
@@ -571,6 +574,7 @@ fn main() {
                     ts: ts.unwrap_or(0),
                     id: Raw::of(f[0]),
                     user: Raw::of(f[1]),
+                    uh: if f[1].is_empty() { 0 } else { hash_bytes(f[1]) },
                     camp: camp.unwrap_or(0),
                     // validity packed into camp via the sentinel below
                 });
@@ -605,7 +609,7 @@ fn main() {
     // ---- links
     let lk_files = map_files(&data.join("links"));
     let lk_chunks = chunks(&lk_files);
-    let links: Vec<(Raw, Raw)> = lk_chunks
+    let links: Vec<(u64, Raw, u64, Raw)> = lk_chunks
         .par_iter()
         .flat_map_iter(|c| {
             let b = &lk_files[c.file][c.start..c.end];
@@ -613,7 +617,7 @@ fn main() {
             for_lines(b, |line| {
                 if let Some([a, bb]) = split::<2>(line) {
                     if !a.is_empty() && !bb.is_empty() {
-                        v.push((Raw::of(a), Raw::of(bb)));
+                        v.push((hash_bytes(a), Raw::of(a), hash_bytes(bb), Raw::of(bb)));
                     }
                 }
             });
@@ -622,57 +626,94 @@ fn main() {
         .collect();
     lg.log(&format!("links: {}", links.len()));
 
-    // ---- ID universe, byte-sorted: index order is byte order, so the smallest index in a component is its name
-    let merge = |mut a: FSet<&'static [u8]>, b: FSet<&'static [u8]>| {
-        if a.len() < b.len() {
-            let mut b = b;
-            std::mem::swap(&mut a, &mut b);
-            a.extend(b);
-            a
-        } else {
-            a.extend(b);
-            a
-        }
-    };
-    let ev_set = ev_surv
+    // ---- ID universe, byte-sorted: index order is byte order, so the smallest index in a component is its name.
+    // IDs are hashed once at parse time and split into 256 shards; each shard's distinct set is small enough to
+    // stay in cache and is built in parallel, so there is nothing to merge.
+    const NBU: usize = 256;
+    type Part = Vec<Vec<(u64, Raw)>>;
+    let shard = |uh: u64| ((uh >> 48) & 0xff) as usize;
+    let mut parts: Vec<Part> = ev_surv
         .par_iter()
-        .fold(FSet::<&'static [u8]>::default, |mut s, v| {
+        .map(|v| {
+            let mut lb: Part = (0..NBU).map(|_| Vec::new()).collect();
             for e in v {
-                s.insert(e.user.get());
+                lb[shard(e.uh)].push((e.uh, e.user));
             }
-            s
+            lb
         })
-        .reduce(FSet::default, merge);
-    let ck_set = ck_surv
-        .par_iter()
-        .fold(FSet::<&'static [u8]>::default, |mut s, v| {
-            for c in v {
-                s.insert(c.user.get());
-            }
-            s
-        })
-        .reduce(FSet::default, merge);
-    let mut all = merge(ev_set, ck_set);
-    for (a, b) in &links {
-        all.insert(a.get());
-        all.insert(b.get());
+        .collect();
+    parts.extend(
+        ck_surv
+            .par_iter()
+            .map(|v| {
+                let mut lb: Part = (0..NBU).map(|_| Vec::new()).collect();
+                for c in v {
+                    lb[shard(c.uh)].push((c.uh, c.user));
+                }
+                lb
+            })
+            .collect::<Vec<Part>>(),
+    );
+    {
+        let mut lb: Part = (0..NBU).map(|_| Vec::new()).collect();
+        for &(ha, a, hb, b) in &links {
+            lb[shard(ha)].push((ha, a));
+            lb[shard(hb)].push((hb, b));
+        }
+        parts.push(lb);
     }
-    let mut uni: Vec<&'static [u8]> = all.into_iter().collect();
-    uni.par_sort_unstable();
-    let n = uni.len();
+    let locals: Vec<(Vec<&'static [u8]>, FMap<&'static [u8], u32>)> = (0..NBU)
+        .into_par_iter()
+        .map(|u| {
+            let mut map: FMap<&'static [u8], u32> = FMap::default();
+            let mut list: Vec<&'static [u8]> = vec![];
+            for p in &parts {
+                for &(_, r) in &p[u] {
+                    let sl = r.get();
+                    if let std::collections::hash_map::Entry::Vacant(v) = map.entry(sl) {
+                        v.insert(list.len() as u32);
+                        list.push(sl);
+                    }
+                }
+            }
+            (list, map)
+        })
+        .collect();
+    drop(parts);
+    let mut base = vec![0u32; NBU + 1];
+    for u in 0..NBU {
+        base[u + 1] = base[u] + locals[u].0.len() as u32;
+    }
+    let n = base[NBU] as usize;
     if n >= u32::MAX as usize - 1 {
         decline("too many ids");
     }
-    let mut id_idx: FMap<&[u8], u32> = FMap::with_capacity_and_hasher(n, FixedState::default());
-    for (i, s) in uni.iter().enumerate() {
-        id_idx.insert(s, i as u32);
+    let mut sorted: Vec<(&'static [u8], u32)> = locals
+        .par_iter()
+        .enumerate()
+        .flat_map_iter(|(u, (list, _))| {
+            let b0 = base[u];
+            list.iter().enumerate().map(move |(i, s)| (*s, b0 + i as u32))
+        })
+        .collect();
+    sorted.par_sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let mut rank = vec![0u32; n];
+    for (r, &(_, code)) in sorted.iter().enumerate() {
+        rank[code as usize] = r as u32;
     }
+    let uni: Vec<&'static [u8]> = sorted.iter().map(|x| x.0).collect();
+    drop(sorted);
+    // sorted index of an ID, given its hash and bytes
+    let id_idx = |uh: u64, r: Raw| -> usize {
+        let u = shard(uh);
+        rank[(base[u] + locals[u].1[r.get()]) as usize] as usize
+    };
     lg.log(&format!("universe: {n} ids"));
 
     // ---- components, named by the smallest index
     let mut parent: Vec<u32> = (0..n as u32).collect();
-    for (a, b) in &links {
-        let (ia, ib) = (id_idx[a.get()], id_idx[b.get()]);
+    for &(ha, a, hb, b) in &links {
+        let (ia, ib) = (id_idx(ha, a) as u32, id_idx(hb, b) as u32);
         let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
         if ra != rb {
             let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
@@ -687,7 +728,7 @@ fn main() {
         .par_iter()
         .flat_map_iter(|v| {
             v.iter().map(|e| E {
-                key: ((pk[id_idx[e.user.get()] as usize] as u64) << 32) | (e.ts - ws) as u64,
+                key: ((pk[id_idx(e.uh, e.user)] as u64) << 32) | (e.ts - ws) as u64,
                 price: e.price,
                 cat: e.cat,
                 purchase: e.purchase,
@@ -768,7 +809,7 @@ fn main() {
         .par_iter()
         .flat_map_iter(|v| {
             v.iter().map(|c| C {
-                key: ((pk[id_idx[c.user.get()] as usize] as u64) << 32) | (c.ts - cws) as u64,
+                key: ((pk[id_idx(c.uh, c.user)] as u64) << 32) | (c.ts - cws) as u64,
                 camp: c.camp,
                 id: c.id,
             })
