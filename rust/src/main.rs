@@ -1357,7 +1357,6 @@ fn main() {
     std::fs::create_dir_all(out.join("user_daily")).expect("output dir");
     std::fs::create_dir_all(out.join("campaign_daily")).expect("output dir");
     let nparts = ncpu.max(1);
-    let name_of = |p: u32| String::from_utf8_lossy(uni[p as usize]).into_owned();
 
     let u_schema = Arc::new(Schema::new(vec![
         Field::new("user_id", DataType::Utf8, false),
@@ -1378,7 +1377,7 @@ fn main() {
         let (mut ss, mut ee, mut rr) = (Int64Builder::new(), Int64Builder::new(), Int64Builder::new());
         let mut top = StringBuilder::new();
         for r in rows {
-            uid.append_value(name_of(r.pk));
+            uid.append_value(String::from_utf8_lossy(uni[r.pk as usize]));
             day.append_value((ws_day + r.day as i64) as i32);
             ss.append_value(r.sessions as i64);
             ee.append_value(r.events as i64);
@@ -1448,7 +1447,7 @@ fn main() {
 }
 
 fn write_part(path: &Path, schema: &Arc<Schema>, cols: Vec<ArrayRef>) {
-    let props = WriterProperties::builder().set_compression(Compression::UNCOMPRESSED).build();
+    let props = WriterProperties::builder().set_compression(Compression::UNCOMPRESSED).set_dictionary_enabled(false).build();
     let f = std::fs::File::create(path).expect("create parquet");
     let mut w = ArrowWriter::try_new(f, schema.clone(), Some(props)).expect("parquet writer");
     let batch = RecordBatch::try_new(schema.clone(), cols).expect("batch");
