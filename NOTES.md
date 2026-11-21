@@ -139,7 +139,7 @@ CPU-s per stage now (cumulative log in `ss` stderr): parse ~4.9, event dedup +2.
 per-bucket sort/sessions/credit/assists +2.4, write +0.7. Every stage is within ~2x of what its algorithm costs on this hardware,
 so no single fix is enough; sub-second needs ~3x less total work, spread over all stages.
 
-Experiments that did NOT help (do not repeat): fewer/more buckets for L2 fit, thread count other than 8, mimalloc env knobs,
+Experiments that did NOT help (do not repeat): branch-free unquote in the scanner (2.50 -> 2.52 s, so branch mispredicts on quoted fields are not the cost), fewer/more buckets for L2 fit, thread count other than 8, mimalloc env knobs,
 quote-count rewrite of split, date prefix table beyond the exact cache.
 
 What a redesign would change (estimates, unmeasured):
@@ -148,7 +148,7 @@ What a redesign would change (estimates, unmeasured):
 2. Fuse event dedup and person bucketing so records are written once: dedup needs event-id partitioning, person work needs
    person partitioning, and duplicates may name a different user (1 in 64), so two partitionings are unavoidable; make the
    second consume the first's output directly instead of re-copying.
-3. Parse: branchless unquote (random 20% quoted fields cost ~2 mispredicts per line), merged 128-bit user hash (one pass, not
+3. Parse: merged 128-bit user hash (one pass, not
    two), keep the SSE2 scanner and SWAR timestamps.
 4. Universe: build user shards at parse time from all well-formed lines (extra IDs from dropped events only add isolated
    nodes, which is safe) to drop the separate copy pass (~0.15 s).
