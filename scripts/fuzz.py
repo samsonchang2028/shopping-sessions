@@ -15,6 +15,7 @@ import sys
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
+RUST = ROOT / "rust" / "target" / "release" / "ss"
 DEFAULT_SEEDS = [2, 3, 4, 5, 7, 11, 15, 42, 272, 1001]
 
 
@@ -43,16 +44,25 @@ def main():
         run([args.generate, "--seed", str(seed), "--events", str(events), "--clicks", str(events // 4),
              "--output", str(d / "data")])
         window = json.loads((d / "data" / "manifest.json").read_text())
-        env = dict(os.environ, DATA_DIR=str(d / "data"), OUTPUT_DIR=str(d / "fast"), CHECK="1")
-        run([py, str(ROOT / "pipeline" / "pipeline.py")], env=env)
         run([py, str(ROOT / "ref" / "reference.py"), str(d / "data"), str(d / "ref")])
-        p = subprocess.run([py, str(HERE / "compare.py"), str(d / "fast"), str(d / "ref")],
-                           capture_output=True, text=True)
-        status = "MATCH" if p.returncode == 0 else "DIFFER"
+        engines = {"duckdb": [py, str(ROOT / "pipeline" / "pipeline.py")]}
+        if RUST.exists():
+            engines["rust"] = [str(RUST)]
+        ok = True
+        verdicts = []
+        for name, cmd in engines.items():
+            env = dict(os.environ, DATA_DIR=str(d / "data"), OUTPUT_DIR=str(d / name), CHECK="1")
+            run(cmd, env=env)
+            p = subprocess.run([py, str(HERE / "compare.py"), str(d / name), str(d / "ref")],
+                               capture_output=True, text=True)
+            good = p.returncode == 0
+            ok &= good
+            verdicts.append(f"{name} {'MATCH' if good else 'DIFFER'}")
+            if not good:
+                print(p.stdout)
         print(f"seed {seed:>5} events {events} window {window['window_start'][:10]}..{window['window_end'][:10]}: "
-              f"{status}  {' | '.join(l for l in p.stdout.splitlines() if l.startswith(('user', 'campaign')))}")
-        if p.returncode != 0:
-            print(p.stdout)
+              + ", ".join(verdicts))
+        if not ok:
             failed.append(seed)
         else:
             shutil.rmtree(d, ignore_errors=True)

@@ -1,5 +1,12 @@
 fixtures/
 dev/
-out/
+bench/
+out*/
+rust/target/
+target/
 *.md
 .git
+.venv/
+dev-answer/
+generator/
+fuzz-data/

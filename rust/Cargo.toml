@@ -1,0 +1,25 @@
+[package]
+name = "ss"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ss"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[dependencies]
+arrow-array = "60.2.0"
+arrow-schema = "60.2.0"
+foldhash = "0.2.0"
+memchr = "2.8.3"
+memmap2 = "0.9.12"
+mimalloc = "0.1.52"
+parquet = { version = "60.2.0", default-features = false, features = ["arrow"] }
+rayon = "1.12.0"
