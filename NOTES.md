@@ -151,7 +151,7 @@ CPU-s per stage now (cumulative log in `ss` stderr): parse ~4.9, event dedup +2.
 per-bucket sort/sessions/credit/assists +2.4, write +0.7. Every stage is within ~2x of what its algorithm costs on this hardware,
 so no single fix is enough; sub-second needs ~3x less total work, spread over all stages.
 
-Experiments that did NOT help (do not repeat): branch-free unquote in the scanner (2.50 -> 2.52 s, so branch mispredicts on quoted fields are not the cost), fewer/more buckets for L2 fit, thread count other than 8, mimalloc env knobs,
+Experiments that did NOT help (do not repeat): generous per-chunk bucket capacity to avoid realloc in parse (2.47 -> 2.51 s), flat prefetched dedup table (+0.04 s), branch-free unquote in the scanner (2.50 -> 2.52 s, so branch mispredicts on quoted fields are not the cost), fewer/more buckets for L2 fit, thread count other than 8, mimalloc env knobs,
 quote-count rewrite of split, date prefix table beyond the exact cache.
 
 What a redesign would change (estimates, unmeasured):
