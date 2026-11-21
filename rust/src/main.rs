@@ -51,22 +51,50 @@ fn decline(why: &str) -> ! {
 
 // ---------------------------------------------------------------- bytes helpers
 
-/// A byte slice stored as raw parts. Every slice points into an Mmap that lives until process exit.
+/// A byte slice packed into 8 bytes: 48-bit address << 16 | 16-bit length. Every slice points into an Mmap
+/// that lives until process exit. A field of 64 KiB or more is outside what this engine supports.
 #[derive(Clone, Copy)]
 struct Raw {
-    p: usize,
-    l: u32,
+    v: u64,
 }
 impl Raw {
     #[inline]
     fn of(s: &[u8]) -> Raw {
-        Raw { p: s.as_ptr() as usize, l: s.len() as u32 }
+        if s.len() > 0xffff {
+            decline("field longer than 64 KiB");
+        }
+        Raw { v: ((s.as_ptr() as u64) << 16) | s.len() as u64 }
     }
     #[inline]
     fn get<'a>(self) -> &'a [u8] {
-        // SAFETY: created from a slice of an Mmap (or a leaked buffer) that is never dropped.
-        unsafe { std::slice::from_raw_parts(self.p as *const u8, self.l as usize) }
+        // SAFETY: created by `of` from a live mmap slice.
+        unsafe { std::slice::from_raw_parts((self.v >> 16) as *const u8, (self.v & 0xffff) as usize) }
     }
+}
+
+/// Hasher for keys that are already hashes.
+#[derive(Default, Clone, Copy)]
+struct IdHasher(u64);
+impl std::hash::Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, b: &[u8]) {
+        for &x in b {
+            self.0 = self.0.rotate_left(8) ^ x as u64;
+        }
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.0 = x;
+    }
+}
+type IdMap<V> = HashMap<u64, V, std::hash::BuildHasherDefault<IdHasher>>;
+
+/// (64-bit hash, independent 32-bit check) of an ID. Two different IDs sharing the 64-bit hash but not the
+/// check make the engine decline; sharing both (about 2^-96 per pair) is treated as the same ID.
+#[inline]
+fn uhash(b: &[u8]) -> (u64, u32) {
+    (hash_bytes(b), (FixedState::with_seed(0x517c_c1b7_2722_0a95).hash_one(b) >> 32) as u32)
 }
 
 #[inline]
@@ -305,6 +333,7 @@ struct Ev {
     id: Raw,
     user: Raw,
     uh: u64,
+    uk: u32,
     price: u32,
     cat: u16,
     ok: bool,
@@ -318,6 +347,7 @@ struct Ck {
     id: Raw,
     user: Raw,
     uh: u64,
+    uk: u32,
     camp: u32,
 }
 
@@ -496,6 +526,7 @@ fn main() {
                     return;
                 }
                 let h = hash_bytes(f[0]);
+                let (uh, uk) = if f[1].is_empty() { (0, 0) } else { uhash(f[1]) };
                 let ing = parse_ts(f[3]).unwrap_or(i64::MAX);
                 let ts = parse_ts(f[2]);
                 let ty = f[4];
@@ -518,7 +549,8 @@ fn main() {
                     ts: ts.unwrap_or(0),
                     id: Raw::of(f[0]),
                     user: Raw::of(f[1]),
-                    uh: if f[1].is_empty() { 0 } else { hash_bytes(f[1]) },
+                    uh,
+                    uk,
                     price,
                     cat,
                     ok,
@@ -566,6 +598,7 @@ fn main() {
                     return;
                 }
                 let h = hash_bytes(f[0]);
+                let (uh, uk) = if f[1].is_empty() { (0, 0) } else { uhash(f[1]) };
                 let ts = parse_ts(f[3]);
                 let camp = camp_idx.get(f[2]).copied();
                 let ok = !f[1].is_empty() && camp.is_some() && matches!(ts, Some(t) if t >= cws && t < we);
@@ -574,7 +607,8 @@ fn main() {
                     ts: ts.unwrap_or(0),
                     id: Raw::of(f[0]),
                     user: Raw::of(f[1]),
-                    uh: if f[1].is_empty() { 0 } else { hash_bytes(f[1]) },
+                    uh,
+                    uk,
                     camp: camp.unwrap_or(0),
                     // validity packed into camp via the sentinel below
                 });
@@ -609,7 +643,7 @@ fn main() {
     // ---- links
     let lk_files = map_files(&data.join("links"));
     let lk_chunks = chunks(&lk_files);
-    let links: Vec<(u64, Raw, u64, Raw)> = lk_chunks
+    let links: Vec<(u64, u32, Raw, u64, u32, Raw)> = lk_chunks
         .par_iter()
         .flat_map_iter(|c| {
             let b = &lk_files[c.file][c.start..c.end];
@@ -617,7 +651,8 @@ fn main() {
             for_lines(b, |line| {
                 if let Some([a, bb]) = split::<2>(line) {
                     if !a.is_empty() && !bb.is_empty() {
-                        v.push((hash_bytes(a), Raw::of(a), hash_bytes(bb), Raw::of(bb)));
+                        let ((ha, ka), (hb, kb)) = (uhash(a), uhash(bb));
+                        v.push((ha, ka, Raw::of(a), hb, kb, Raw::of(bb)));
                     }
                 }
             });
@@ -630,14 +665,14 @@ fn main() {
     // IDs are hashed once at parse time and split into 256 shards; each shard's distinct set is small enough to
     // stay in cache and is built in parallel, so there is nothing to merge.
     const NBU: usize = 256;
-    type Part = Vec<Vec<(u64, Raw)>>;
+    type Part = Vec<Vec<(u64, u32, Raw)>>;
     let shard = |uh: u64| ((uh >> 48) & 0xff) as usize;
     let mut parts: Vec<Part> = ev_surv
         .par_iter()
         .map(|v| {
             let mut lb: Part = (0..NBU).map(|_| Vec::new()).collect();
             for e in v {
-                lb[shard(e.uh)].push((e.uh, e.user));
+                lb[shard(e.uh)].push((e.uh, e.uk, e.user));
             }
             lb
         })
@@ -648,7 +683,7 @@ fn main() {
             .map(|v| {
                 let mut lb: Part = (0..NBU).map(|_| Vec::new()).collect();
                 for c in v {
-                    lb[shard(c.uh)].push((c.uh, c.user));
+                    lb[shard(c.uh)].push((c.uh, c.uk, c.user));
                 }
                 lb
             })
@@ -656,23 +691,29 @@ fn main() {
     );
     {
         let mut lb: Part = (0..NBU).map(|_| Vec::new()).collect();
-        for &(ha, a, hb, b) in &links {
-            lb[shard(ha)].push((ha, a));
-            lb[shard(hb)].push((hb, b));
+        for &(ha, ka, a, hb, kb, b) in &links {
+            lb[shard(ha)].push((ha, ka, a));
+            lb[shard(hb)].push((hb, kb, b));
         }
         parts.push(lb);
     }
-    let locals: Vec<(Vec<&'static [u8]>, FMap<&'static [u8], u32>)> = (0..NBU)
+    let locals: Vec<(Vec<Raw>, IdMap<(u32, u32)>)> = (0..NBU)
         .into_par_iter()
         .map(|u| {
-            let mut map: FMap<&'static [u8], u32> = FMap::default();
-            let mut list: Vec<&'static [u8]> = vec![];
+            let mut map: IdMap<(u32, u32)> = IdMap::default();
+            let mut list: Vec<Raw> = vec![];
             for p in &parts {
-                for &(_, r) in &p[u] {
-                    let sl = r.get();
-                    if let std::collections::hash_map::Entry::Vacant(v) = map.entry(sl) {
-                        v.insert(list.len() as u32);
-                        list.push(sl);
+                for &(uh, uk, r) in &p[u] {
+                    match map.entry(uh) {
+                        std::collections::hash_map::Entry::Occupied(o) => {
+                            if o.get().0 != uk {
+                                decline("64-bit hash collision between different ids");
+                            }
+                        }
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert((uk, list.len() as u32));
+                            list.push(r);
+                        }
                     }
                 }
             }
@@ -688,7 +729,7 @@ fn main() {
     if n >= u32::MAX as usize - 1 {
         decline("too many ids");
     }
-    let mut sorted: Vec<(&'static [u8], u32)> = locals
+    let mut sorted: Vec<(Raw, u32)> = locals
         .par_iter()
         .enumerate()
         .flat_map_iter(|(u, (list, _))| {
@@ -696,24 +737,24 @@ fn main() {
             list.iter().enumerate().map(move |(i, s)| (*s, b0 + i as u32))
         })
         .collect();
-    sorted.par_sort_unstable_by(|a, b| a.0.cmp(b.0));
+    sorted.par_sort_unstable_by(|a, b| a.0.get().cmp(b.0.get()));
     let mut rank = vec![0u32; n];
     for (r, &(_, code)) in sorted.iter().enumerate() {
         rank[code as usize] = r as u32;
     }
-    let uni: Vec<&'static [u8]> = sorted.iter().map(|x| x.0).collect();
+    let uni: Vec<&'static [u8]> = sorted.iter().map(|x| x.0.get()).collect();
     drop(sorted);
     // sorted index of an ID, given its hash and bytes
-    let id_idx = |uh: u64, r: Raw| -> usize {
+    let id_idx = |uh: u64| -> usize {
         let u = shard(uh);
-        rank[(base[u] + locals[u].1[r.get()]) as usize] as usize
+        rank[(base[u] + locals[u].1[&uh].1) as usize] as usize
     };
     lg.log(&format!("universe: {n} ids"));
 
     // ---- components, named by the smallest index
     let mut parent: Vec<u32> = (0..n as u32).collect();
-    for &(ha, a, hb, b) in &links {
-        let (ia, ib) = (id_idx(ha, a) as u32, id_idx(hb, b) as u32);
+    for &(ha, _, _, hb, _, _) in &links {
+        let (ia, ib) = (id_idx(ha) as u32, id_idx(hb) as u32);
         let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
         if ra != rb {
             let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
@@ -728,7 +769,7 @@ fn main() {
         .par_iter()
         .flat_map_iter(|v| {
             v.iter().map(|e| E {
-                key: ((pk[id_idx(e.uh, e.user)] as u64) << 32) | (e.ts - ws) as u64,
+                key: ((pk[id_idx(e.uh)] as u64) << 32) | (e.ts - ws) as u64,
                 price: e.price,
                 cat: e.cat,
                 purchase: e.purchase,
@@ -809,7 +850,7 @@ fn main() {
         .par_iter()
         .flat_map_iter(|v| {
             v.iter().map(|c| C {
-                key: ((pk[id_idx(c.uh, c.user)] as u64) << 32) | (c.ts - cws) as u64,
+                key: ((pk[id_idx(c.uh)] as u64) << 32) | (c.ts - cws) as u64,
                 camp: c.camp,
                 id: c.id,
             })
