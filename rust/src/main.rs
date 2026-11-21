@@ -325,30 +325,49 @@ fn chunks(files: &[Mmap]) -> Vec<Chunk> {
 
 // ---------------------------------------------------------------- records
 
+/// Event record, 48 bytes. `line` locates the source line; id and user are re-derived from it when needed.
 #[derive(Clone, Copy)]
 struct Ev {
     h: u64,
-    ing: i64,
-    ts: i64,
-    id: Raw,
-    user: Raw,
     uh: u64,
-    uk: u32,
+    line: Raw,
+    ts: u32,  // ms since window_start, valid when `ok`
+    ing: u32, // ingest_ts in whole seconds since the epoch; u32::MAX if invalid
     price: u32,
+    uk: u32,
     cat: u16,
     ok: bool,
     purchase: bool,
 }
 
+/// Click record, 40 bytes. `camp == u32::MAX` marks an invalid click.
 #[derive(Clone, Copy)]
 struct Ck {
     h: u64,
-    ts: i64,
-    id: Raw,
-    user: Raw,
     uh: u64,
+    line: Raw,
+    ts: u32, // ms since window_start - 7 days
     uk: u32,
     camp: u32,
+}
+
+/// The n-th (0-based) field of a validated line, unquoted.
+fn nth_field(line: &[u8], n: usize) -> &[u8] {
+    let mut it = memchr_iter(b',', line);
+    let mut start = 0;
+    for _ in 0..n {
+        start = it.next().map_or(line.len(), |p| p + 1);
+    }
+    let end = it.next().unwrap_or(line.len());
+    field(&line[start.min(end)..end]).unwrap_or(&line[0..0])
+}
+#[inline]
+fn id_of<'a>(line: Raw) -> &'a [u8] {
+    nth_field(line.get(), 0)
+}
+#[inline]
+fn user_of<'a>(line: Raw) -> &'a [u8] {
+    nth_field(line.get(), 1)
 }
 
 /// Keep, for every distinct id, the first record of the group sorted by (hash, ing). `idof` gives the id bytes.
@@ -378,6 +397,53 @@ fn dedup_sorted<T: Copy>(v: &[T], h: impl Fn(&T) -> u64, idof: impl Fn(&T) -> &[
         }
         i = j;
     }
+}
+
+/// Dedup bucket `b` of every chunk: one record per distinct id, the `earlier` one wins. A hash table keyed on the id
+/// hash does it in one pass; if two different ids ever share a hash, the bucket is redone exactly by sorting.
+fn dedup_bucket<T: Copy + Send + Sync>(
+    parts: &[Vec<Vec<T>>],
+    b: usize,
+    h: impl Fn(&T) -> u64,
+    idof: impl Fn(&T) -> &[u8],
+    earlier: impl Fn(&T, &T) -> bool,
+    order: impl Fn(&T) -> (u64, u64),
+) -> Vec<T> {
+    let total: usize = parts.iter().map(|p| p[b].len()).sum();
+    let mut map: IdMap<u32> = IdMap::with_capacity_and_hasher(total, Default::default());
+    let mut store: Vec<T> = Vec::with_capacity(total);
+    let mut collided = false;
+    'outer: for p in parts {
+        for &e in &p[b] {
+            match map.entry(h(&e)) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(store.len() as u32);
+                    store.push(e);
+                }
+                std::collections::hash_map::Entry::Occupied(o) => {
+                    let cur = &mut store[*o.get() as usize];
+                    if idof(cur) != idof(&e) {
+                        collided = true;
+                        break 'outer;
+                    }
+                    if earlier(&e, cur) {
+                        *cur = e;
+                    }
+                }
+            }
+        }
+    }
+    if !collided {
+        return store;
+    }
+    let mut v: Vec<T> = Vec::with_capacity(total);
+    for p in parts {
+        v.extend_from_slice(&p[b]);
+    }
+    v.sort_unstable_by_key(|e| order(e));
+    let mut out = Vec::new();
+    dedup_sorted(&v, &h, &idof, |e| out.push(e));
+    out
 }
 
 fn find(parent: &mut [u32], mut x: u32) -> u32 {
@@ -519,7 +585,8 @@ fn main() {
         .par_iter()
         .map(|c| {
             let b = &ev_files[c.file][c.start..c.end];
-            let mut buckets: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::new()).collect();
+            let est = b.len() / 80 / NB + 8;
+            let mut buckets: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::with_capacity(est)).collect();
             for_lines(b, |line| {
                 let Some(f) = split::<7>(line) else { return };
                 if f[0].is_empty() {
@@ -527,7 +594,11 @@ fn main() {
                 }
                 let h = hash_bytes(f[0]);
                 let (uh, uk) = if f[1].is_empty() { (0, 0) } else { uhash(f[1]) };
-                let ing = parse_ts(f[3]).unwrap_or(i64::MAX);
+                let ing = match parse_ts(f[3]) {
+                    None => u32::MAX,
+                    Some(ms) if ms >= 0 && ms % 1000 == 0 && ms / 1000 < u32::MAX as i64 => (ms / 1000) as u32,
+                    Some(_) => decline("ingest_ts is not whole seconds in 1970..2106"),
+                };
                 let ts = parse_ts(f[2]);
                 let ty = f[4];
                 let purchase = ty == b"purchase";
@@ -546,9 +617,8 @@ fn main() {
                 buckets[(h >> 56) as usize].push(Ev {
                     h,
                     ing,
-                    ts: ts.unwrap_or(0),
-                    id: Raw::of(f[0]),
-                    user: Raw::of(f[1]),
+                    ts: if ok { (ts.unwrap() - ws) as u32 } else { 0 },
+                    line: Raw::of(line),
                     uh,
                     uk,
                     price,
@@ -566,19 +636,16 @@ fn main() {
     let ev_surv: Vec<Vec<Ev>> = (0..NB)
         .into_par_iter()
         .map(|b| {
-            let total: usize = parts.iter().map(|p| p[b].len()).sum();
-            let mut v: Vec<Ev> = Vec::with_capacity(total);
-            for p in &parts {
-                v.extend_from_slice(&p[b]);
-            }
-            v.sort_unstable_by_key(|e| (e.h, e.ing));
-            let mut keep = Vec::with_capacity(v.len());
-            dedup_sorted(&v, |e| e.h, |e| e.id.get(), |e| {
-                if e.ok && e.ing - e.ts <= DAY {
-                    keep.push(e)
-                }
-            });
-            keep
+            let mut v = dedup_bucket(
+                &parts,
+                b,
+                |e: &Ev| e.h,
+                |e: &Ev| id_of(e.line),
+                |a: &Ev, b: &Ev| a.ing < b.ing,
+                |e: &Ev| (e.h, e.ing as u64),
+            );
+            v.retain(|e| e.ok && e.ing as i64 * 1000 - (ws + e.ts as i64) <= DAY);
+            v
         })
         .collect();
     drop(parts);
@@ -591,7 +658,8 @@ fn main() {
         .par_iter()
         .map(|c| {
             let b = &ck_files[c.file][c.start..c.end];
-            let mut buckets: Vec<Vec<Ck>> = (0..NB).map(|_| Vec::new()).collect();
+            let est = b.len() / 50 / NB + 8;
+            let mut buckets: Vec<Vec<Ck>> = (0..NB).map(|_| Vec::with_capacity(est)).collect();
             for_lines(b, |line| {
                 let Some(f) = split::<4>(line) else { return };
                 if f[0].is_empty() {
@@ -604,17 +672,12 @@ fn main() {
                 let ok = !f[1].is_empty() && camp.is_some() && matches!(ts, Some(t) if t >= cws && t < we);
                 buckets[(h >> 56) as usize].push(Ck {
                     h,
-                    ts: ts.unwrap_or(0),
-                    id: Raw::of(f[0]),
-                    user: Raw::of(f[1]),
+                    ts: if ok { (ts.unwrap() - cws) as u32 } else { 0 },
+                    line: Raw::of(line),
                     uh,
                     uk,
-                    camp: camp.unwrap_or(0),
-                    // validity packed into camp via the sentinel below
+                    camp: if ok { camp.unwrap() } else { u32::MAX },
                 });
-                if !ok {
-                    buckets[(h >> 56) as usize].last_mut().unwrap().camp = u32::MAX;
-                }
             });
             buckets
         })
@@ -622,19 +685,16 @@ fn main() {
     let ck_surv: Vec<Vec<Ck>> = (0..NB)
         .into_par_iter()
         .map(|b| {
-            let total: usize = cparts.iter().map(|p| p[b].len()).sum();
-            let mut v: Vec<Ck> = Vec::with_capacity(total);
-            for p in &cparts {
-                v.extend_from_slice(&p[b]);
-            }
-            v.sort_unstable_by_key(|c| c.h);
-            let mut keep = Vec::new();
-            dedup_sorted(&v, |c| c.h, |c| c.id.get(), |c| {
-                if c.camp != u32::MAX {
-                    keep.push(c)
-                }
-            });
-            keep
+            let mut v = dedup_bucket(
+                &cparts,
+                b,
+                |c: &Ck| c.h,
+                |c: &Ck| id_of(c.line),
+                |_: &Ck, _: &Ck| false, // copies of a click are identical: keep the first
+                |c: &Ck| (c.h, 0),
+            );
+            v.retain(|c| c.camp != u32::MAX);
+            v
         })
         .collect();
     drop(cparts);
@@ -665,14 +725,15 @@ fn main() {
     // IDs are hashed once at parse time and split into 256 shards; each shard's distinct set is small enough to
     // stay in cache and is built in parallel, so there is nothing to merge.
     const NBU: usize = 256;
-    type Part = Vec<Vec<(u64, u32, Raw)>>;
+    type Part = Vec<Vec<(u64, u32, Raw, u8)>>; // (hash, check, line-or-user, 0 = line / 1 = user bytes)
     let shard = |uh: u64| ((uh >> 48) & 0xff) as usize;
     let mut parts: Vec<Part> = ev_surv
         .par_iter()
         .map(|v| {
-            let mut lb: Part = (0..NBU).map(|_| Vec::new()).collect();
+            let est = v.len() / NBU + v.len() / NBU / 4 + 8;
+            let mut lb: Part = (0..NBU).map(|_| Vec::with_capacity(est)).collect();
             for e in v {
-                lb[shard(e.uh)].push((e.uh, e.uk, e.user));
+                lb[shard(e.uh)].push((e.uh, e.uk, e.line, 0));
             }
             lb
         })
@@ -681,9 +742,10 @@ fn main() {
         ck_surv
             .par_iter()
             .map(|v| {
-                let mut lb: Part = (0..NBU).map(|_| Vec::new()).collect();
+                let est = v.len() / NBU + v.len() / NBU / 4 + 8;
+                let mut lb: Part = (0..NBU).map(|_| Vec::with_capacity(est)).collect();
                 for c in v {
-                    lb[shard(c.uh)].push((c.uh, c.uk, c.user));
+                    lb[shard(c.uh)].push((c.uh, c.uk, c.line, 0));
                 }
                 lb
             })
@@ -692,18 +754,19 @@ fn main() {
     {
         let mut lb: Part = (0..NBU).map(|_| Vec::new()).collect();
         for &(ha, ka, a, hb, kb, b) in &links {
-            lb[shard(ha)].push((ha, ka, a));
-            lb[shard(hb)].push((hb, kb, b));
+            lb[shard(ha)].push((ha, ka, a, 1));
+            lb[shard(hb)].push((hb, kb, b, 1));
         }
         parts.push(lb);
     }
+    lg.log("  universe: sharded");
     let locals: Vec<(Vec<Raw>, IdMap<(u32, u32)>)> = (0..NBU)
         .into_par_iter()
         .map(|u| {
             let mut map: IdMap<(u32, u32)> = IdMap::default();
             let mut list: Vec<Raw> = vec![];
             for p in &parts {
-                for &(uh, uk, r) in &p[u] {
+                for &(uh, uk, r, tag) in &p[u] {
                     match map.entry(uh) {
                         std::collections::hash_map::Entry::Occupied(o) => {
                             if o.get().0 != uk {
@@ -712,7 +775,7 @@ fn main() {
                         }
                         std::collections::hash_map::Entry::Vacant(v) => {
                             v.insert((uk, list.len() as u32));
-                            list.push(r);
+                            list.push(if tag == 0 { Raw::of(user_of(r)) } else { r });
                         }
                     }
                 }
@@ -721,6 +784,7 @@ fn main() {
         })
         .collect();
     drop(parts);
+    lg.log("  universe: shard tables");
     let mut base = vec![0u32; NBU + 1];
     for u in 0..NBU {
         base[u + 1] = base[u] + locals[u].0.len() as u32;
@@ -729,20 +793,35 @@ fn main() {
     if n >= u32::MAX as usize - 1 {
         decline("too many ids");
     }
-    let mut sorted: Vec<(Raw, u32)> = locals
+    // Byte-wise sort of the distinct IDs. Comparing mapped bytes costs two cache misses per comparison, so sort by
+    // the first 8 bytes (big-endian, zero padded: this orders exactly like the bytes) and compare full bytes only
+    // when the prefixes are equal.
+    #[derive(Clone, Copy)]
+    struct SortEnt {
+        pre: u64,
+        code: u32,
+    }
+    let raws: Vec<Raw> = locals.iter().flat_map(|(l, _)| l.iter().copied()).collect();
+    let mut sorted: Vec<SortEnt> = raws
         .par_iter()
         .enumerate()
-        .flat_map_iter(|(u, (list, _))| {
-            let b0 = base[u];
-            list.iter().enumerate().map(move |(i, s)| (*s, b0 + i as u32))
+        .map(|(i, r)| {
+            let b = r.get();
+            let mut x = [0u8; 8];
+            let k = b.len().min(8);
+            x[..k].copy_from_slice(&b[..k]);
+            SortEnt { pre: u64::from_be_bytes(x), code: i as u32 }
         })
         .collect();
-    sorted.par_sort_unstable_by(|a, b| a.0.get().cmp(b.0.get()));
+    sorted.par_sort_unstable_by(|a, b| {
+        a.pre.cmp(&b.pre).then_with(|| raws[a.code as usize].get().cmp(raws[b.code as usize].get()))
+    });
+    lg.log("  universe: sorted");
     let mut rank = vec![0u32; n];
-    for (r, &(_, code)) in sorted.iter().enumerate() {
-        rank[code as usize] = r as u32;
+    for (r, e) in sorted.iter().enumerate() {
+        rank[e.code as usize] = r as u32;
     }
-    let uni: Vec<&'static [u8]> = sorted.iter().map(|x| x.0.get()).collect();
+    let uni: Vec<&'static [u8]> = sorted.iter().map(|e| raws[e.code as usize].get()).collect();
     drop(sorted);
     // sorted index of an ID, given its hash and bytes
     let id_idx = |uh: u64| -> usize {
@@ -769,7 +848,7 @@ fn main() {
         .par_iter()
         .flat_map_iter(|v| {
             v.iter().map(|e| E {
-                key: ((pk[id_idx(e.uh)] as u64) << 32) | (e.ts - ws) as u64,
+                key: ((pk[id_idx(e.uh)] as u64) << 32) | e.ts as u64,
                 price: e.price,
                 cat: e.cat,
                 purchase: e.purchase,
@@ -850,14 +929,14 @@ fn main() {
         .par_iter()
         .flat_map_iter(|v| {
             v.iter().map(|c| C {
-                key: ((pk[id_idx(c.uh)] as u64) << 32) | (c.ts - cws) as u64,
+                key: ((pk[id_idx(c.uh)] as u64) << 32) | c.ts as u64,
                 camp: c.camp,
-                id: c.id,
+                id: c.line,
             })
         })
         .collect();
     drop(ck_surv);
-    cks.par_sort_unstable_by(|a, b| a.key.cmp(&b.key).then_with(|| a.id.get().cmp(b.id.get())));
+    cks.par_sort_unstable_by(|a, b| a.key.cmp(&b.key).then_with(|| id_of(a.id).cmp(id_of(b.id))));
     lg.log("clicks sorted");
 
     // ---- credit + assists per person

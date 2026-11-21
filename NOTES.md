@@ -79,13 +79,19 @@ clicks sorted by (person, ts, click_id bytes), credit by two-pointer merge, assi
 | duckdb engine, first correct | 4.4 | 65.6 | | 11.5 GB / |
 | duckdb engine, sentinel reader | 4.4 | 38.8 | | 8.5 GB / |
 | native, first | 0.35 (Docker 0.57) | 9.0 | | 5.1 GB / |
-| native, sharded interning, thin LTO (c10acc5 + this) | Docker 0.26 | 6.3 (Docker 6.5) | 25.2 | 5.9 GB / 16.3 GB |
+| native, sharded interning, thin LTO (ad91569) | Docker 0.26 | 6.3 (Docker 6.5) | 25.2 | 5.9 GB / 16.3 GB |
+| native, hash-keyed IDs (d905796) | | 4.75 | | 5.1 GB / |
+| native, 48 B records, hash-table dedup, prefix-sorted universe | Docker 0.25 | 3.7 (Docker 4.9) | not re-run | 4.9 GB / |
 
 20M native stages: parse 1.2, dedup 1.0, clicks 0.3, universe 1.4, components 0.3, pack+sort events 1.3, sessions 0.2,
 clicks sorted 0.4, credit+assists 0.1, write 0.1. 60M/20M = 4.0x (target <= 3.5x), parse is 4.3x: suspect page-cache and
 memory pressure (5.4 GB input, 16 GB RSS); not investigated yet.
 
+20M native stages now (cumulative s): parse 1.15, dedup 1.75, clicks 2.0, universe 2.3 (0.3 s: shard 0.15, tables 0.08, prefix sort 0.04),
+components 2.4, events sorted 3.0, sessions+clicks sorted+credit+write 3.7. Biggest remaining: parse (about 1.1 s), events packed+sorted (0.65 s), dedup (0.6 s).
+
 ## Rejected ideas / why
+- Sorting IDs by comparing mmapped bytes: 0.66 s for 1.5M IDs (two cache misses per compare). 8-byte big-endian prefix + full compare on ties: 0.04 s.
 
 - Date-prefix lookup table for timestamps: in Rust exact days_from_civil + calendar checks cost about the same as a table
   lookup and cannot be wrong about leap years, so the table adds risk for no gain.
