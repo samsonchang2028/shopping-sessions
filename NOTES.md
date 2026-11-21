@@ -129,3 +129,28 @@ SWAR timestamps (8-byte validate+parse of HH:MM:SS and of 8 epoch-ms digits): pa
 - DuckDB regexp_extract with 14 capture groups for fields: 11 s vs 5.3 s for fullmatch+split at 20M.
 - scipy connected_components: replaced by union-find in the native engine (no Python at all on the fast path).
 - fat LTO + 1 codegen unit: Docker build 5m14s vs 56s with thin LTO and 16 units, identical run time.
+
+## Path to sub-second at 20M (not done; read this before starting)
+
+State at `9c1cabab`: 20M = about 2.45-2.7 s local (noisy shared laptop: 4 cores / 8 threads), about 3.0-3.2 s in Docker, 17 CPU-s
+user. The leaderboard's 0.65 s at 20M on 8 vCPU is ~5 CPU-s total, i.e. about 260 ns per event for EVERYTHING; we spend ~800.
+
+CPU-s per stage now (cumulative log in `ss` stderr): parse ~4.9, event dedup +2.9, clicks +1.2, universe +1.6, bucket-by-person +2.3,
+per-bucket sort/sessions/credit/assists +2.4, write +0.7. Every stage is within ~2x of what its algorithm costs on this hardware,
+so no single fix is enough; sub-second needs ~3x less total work, spread over all stages.
+
+Experiments that did NOT help (do not repeat): fewer/more buckets for L2 fit, thread count other than 8, mimalloc env knobs,
+quote-count rewrite of split, date prefix table beyond the exact cache.
+
+What a redesign would change (estimates, unmeasured):
+1. Records: 48 B -> 24 B (h, uh, ts, ing, flags); purchase price/category in a side list (3% of events). About 10 passes over
+   ~1 GB of records now; target 4 passes over ~0.5 GB. Memory traffic is a big part of the cost on this machine.
+2. Fuse event dedup and person bucketing so records are written once: dedup needs event-id partitioning, person work needs
+   person partitioning, and duplicates may name a different user (1 in 64), so two partitionings are unavoidable; make the
+   second consume the first's output directly instead of re-copying.
+3. Parse: branchless unquote (random 20% quoted fields cost ~2 mispredicts per line), merged 128-bit user hash (one pass, not
+   two), keep the SSE2 scanner and SWAR timestamps.
+4. Universe: build user shards at parse time from all well-formed lines (extra IDs from dropped events only add isolated
+   nodes, which is safe) to drop the separate copy pass (~0.15 s).
+5. Components: sequential, 0.15 s; parallel hooking only if it still shows up.
+Realistic outcome of 1-4: about 1.5-2 s on this laptop. Reaching < 1 s probably also needs the scorer's quieter 8 vCPU Xeon.
