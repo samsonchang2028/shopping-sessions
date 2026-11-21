@@ -30,3 +30,18 @@ run-dev: build
 ANSWER ?= dev-answer
 check-dev:
 	python3 scripts/compare.py out $(ANSWER)
+
+## ---- local harness (no Docker): unit tests, fixtures, fuzz, dev check
+PY ?= .venv/bin/python
+.PHONY: unit fixtures-local fixtures-ref fuzz check-local test-all
+unit:
+	$(PY) -m unittest discover -s tests
+fixtures-local:
+	CHECK=1 $(PY) scripts/run_fixtures.py $(FIXTURES) -- $(PY) pipeline/pipeline.py
+fixtures-ref:
+	$(PY) scripts/run_fixtures.py $(FIXTURES) -- $(PY) ref/reference.py
+fuzz:
+	$(PY) scripts/fuzz.py
+check-local:
+	rm -rf out && CHECK=1 DATA_DIR=$(DEV) OUTPUT_DIR=out $(PY) pipeline/pipeline.py && $(PY) scripts/compare.py out $(ANSWER)
+test-all: unit fixtures-local fixtures-ref check-local fuzz

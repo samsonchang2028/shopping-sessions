@@ -268,7 +268,7 @@ def run(data, out, scratch, ncpu, mem_gb, check=False):
     """)
     stage("credit", f"""
         CREATE TEMP TABLE cred AS
-        SELECT s.dayn, s.has_p, s.rev,
+        SELECT s.pk, s.sess_no, s.start, s.dayn, s.has_p, s.rev,
                CASE WHEN cp.ts IS NOT NULL AND s.start - cp.ts <= {WEEK_MS} THEN cp.campaign_id ELSE 'organic' END AS campaign_id
         FROM sess s ASOF LEFT JOIN cp ON s.pk = cp.pk AND s.start >= cp.ts
     """)
@@ -329,6 +329,7 @@ def run(data, out, scratch, ncpu, mem_gb, check=False):
     if check:
         check_invariants(con, ud_dir, cd_dir)
     log("done")
+    return con
 
 
 def check_invariants(con, ud_dir, cd_dir):
