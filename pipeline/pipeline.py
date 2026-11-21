@@ -25,52 +25,26 @@ WEEK_MS = 604_800_000
 
 # One CSV field under rules.md: either fully quoted with no quote inside, or no quote at all.
 # No value ever holds a comma, so every comma separates fields.
-FIELD = '(?:"[^",]*"|[^",]*)'
-
-
-def line_re(arity):
-    return FIELD + (',' + FIELD) * (arity - 1)
-
-
 def log(msg):
     print(f"[{time.perf_counter() - T0:7.3f}s] {msg}", file=sys.stderr, flush=True)
 
 
 MACROS = r"""
--- Calendar date/time -> epoch ms, NULL if any component is out of range.
--- Inputs are already known to be ASCII-digit substrings, so the casts cannot fail.
--- Hinnant days_from_civil; y >= 1970 so every operand is non-negative and // is floor division.
-CREATE OR REPLACE TEMP MACRO civil_days(yp, mo, d) AS
-  (yp // 400) * 146097
-  + (yp % 400) * 365 + (yp % 400) // 4 - (yp % 400) // 100
-  + (153 * (mo + CASE WHEN mo > 2 THEN -3 ELSE 9 END) + 2) // 5 + d - 1
-  - 719468;
-CREATE OR REPLACE TEMP MACRO civil_ms(y, mo, d, h, mi, se) AS
-  CASE WHEN y BETWEEN 1970 AND 2100 AND mo BETWEEN 1 AND 12 AND h <= 23 AND mi <= 59 AND se <= 59
-        AND d >= 1
-        AND d <= CASE WHEN mo = 2 THEN (CASE WHEN (y % 4 = 0 AND y % 100 <> 0) OR y % 400 = 0 THEN 29 ELSE 28 END)
-                      WHEN mo IN (4, 6, 9, 11) THEN 30 ELSE 31 END
-  THEN ((civil_days(CAST(y AS BIGINT) - CASE WHEN mo <= 2 THEN 1 ELSE 0 END, CAST(mo AS BIGINT), CAST(d AS BIGINT)) * 24
-         + h) * 60 + mi) * 60000 + CAST(se AS BIGINT) * 1000
-  END;
-
 -- ts string -> epoch ms (BIGINT) or NULL. Forms F1, F2, F3 of rules.md, nothing else.
+-- The regex fixes the exact shape (ASCII digits, separators, zone); try_strptime then rejects impossible
+-- calendar values (month 13, Feb 30, Feb 29 off leap years, hour 24, minute/second 60): see tests/test_units.py.
 CREATE OR REPLACE TEMP MACRO ts_ms(s) AS
   CASE
+    WHEN regexp_full_match(s, '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z') THEN
+      epoch_ms(try_strptime(s, '%Y-%m-%dT%H:%M:%SZ'))
     WHEN regexp_full_match(s, '[0-9]+') THEN
       CASE WHEN length(ltrim(s, '0')) > 15 THEN NULL
            WHEN ltrim(s, '0') = '' THEN 0::BIGINT
            ELSE CAST(ltrim(s, '0') AS BIGINT) END
-    WHEN regexp_full_match(s, '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:Z|[+-][0-9]{2}:[0-9]{2})') THEN
-      CASE WHEN length(s) = 20 THEN
-             civil_ms(CAST(substr(s, 1, 4) AS INTEGER), CAST(substr(s, 6, 2) AS INTEGER), CAST(substr(s, 9, 2) AS INTEGER),
-                      CAST(substr(s, 12, 2) AS INTEGER), CAST(substr(s, 15, 2) AS INTEGER), CAST(substr(s, 18, 2) AS INTEGER))
-           WHEN CAST(substr(s, 21, 2) AS INTEGER) <= 23 AND CAST(substr(s, 24, 2) AS INTEGER) <= 59 THEN
-             civil_ms(CAST(substr(s, 1, 4) AS INTEGER), CAST(substr(s, 6, 2) AS INTEGER), CAST(substr(s, 9, 2) AS INTEGER),
-                      CAST(substr(s, 12, 2) AS INTEGER), CAST(substr(s, 15, 2) AS INTEGER), CAST(substr(s, 18, 2) AS INTEGER))
-             - (CASE WHEN substr(s, 20, 1) = '+' THEN 1 ELSE -1 END)
-               * (CAST(substr(s, 21, 2) AS BIGINT) * 3600000 + CAST(substr(s, 24, 2) AS BIGINT) * 60000)
-           ELSE NULL END
+    WHEN regexp_full_match(s, '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-](?:[01][0-9]|2[0-3]):[0-5][0-9]') THEN
+      epoch_ms(try_strptime(substr(s, 1, 19), '%Y-%m-%dT%H:%M:%S'))
+      - (CASE WHEN substr(s, 20, 1) = '+' THEN 1 ELSE -1 END)
+        * (CAST(substr(s, 21, 2) AS BIGINT) * 3600000 + CAST(substr(s, 24, 2) AS BIGINT) * 60000)
     ELSE NULL
   END;
 
@@ -92,37 +66,45 @@ def connect(ncpu, mem_gb, scratch):
     return con
 
 
-def lines_sql(con, folder, alias):
-    """Register a view `alias(l VARCHAR)` with every data line (header excluded) of every *.csv in folder.
+def fok(f):
+    """SQL: raw field f is well formed (not missing; no quote, or one quote pair around the whole field)."""
+    return (f"({f} IS NOT NULL AND (NOT contains({f}, '\"') OR (length({f}) >= 2 AND starts_with({f}, '\"') "
+            f"AND ends_with({f}, '\"') AND NOT contains(substr({f}, 2, length({f}) - 2), '\"'))))")
 
-    Fast path: DuckDB's CSV reader with no delimiter/quote, strict mode. It treats a bare \\r as a line
-    break, which rules.md forbids, but in strict mode it raises on any \\r instead of splitting. On any
-    error we fall back to an exact byte split (read_text + string_split on \\n), which keeps \\r.
+
+def funq(f):
+    """SQL: unquoted value of a well-formed raw field, NULL if empty."""
+    return f"NULLIF(CASE WHEN starts_with({f}, '\"') THEN substr({f}, 2, length({f}) - 2) ELSE {f} END, '')"
+
+
+def family_sql(folder, names, mode):
+    """SQL relation with columns `names` (unquoted, NULL for empty) for every well-formed data line.
+
+    fast:  DuckDB's CSV reader, no quoting, one extra sentinel column `x`, nullstr = a newline (which no
+           field can hold), null padding, strict mode, ignore_errors. A line of exactly len(names) fields is
+           the only kind with every column non-NULL and x NULL: shorter lines pad with NULL, longer ones fill
+           x (or are rejected), empty lines are skipped. Strict mode raises on any \\r (which DuckDB would
+           otherwise treat as a line break); the caller then reruns with `exact`.
+    exact: read_text + string_split on \\n, so \\r stays data.
     """
     glob = os.path.join(folder, "*.csv").replace("'", "''")
+    k = len(names)
     if not os.path.isdir(folder) or not any(n.endswith(".csv") for n in os.listdir(folder)):
-        con.execute(f"CREATE OR REPLACE TEMP VIEW {alias} AS SELECT NULL::VARCHAR AS l WHERE false")
-        return "empty"
-    fast = (f"SELECT l FROM read_csv('{glob}', columns={{'l': 'VARCHAR'}}, header=true, auto_detect=false, "
-            f"delim='\\x1f', quote='', escape='', new_line='\\n', comment='', skip=0, strict_mode=true, "
-            f"null_padding=false, ignore_errors=false)")
-    try:
-        con.execute(f"CREATE OR REPLACE TEMP TABLE {alias} AS {fast}")
-        return "fast"
-    except duckdb.Error as error:
-        log(f"{alias}: fast line reader refused ({str(error).splitlines()[0][:90]}); exact split")
-    exact = (f"SELECT unnest((string_split(content, chr(10)))[2:]) AS l "
-             f"FROM read_text('{glob}')")
-    con.execute(f"CREATE OR REPLACE TEMP TABLE {alias} AS {exact}")
-    return "exact"
-
-
-def fields_sql(src, arity, names):
-    """SELECT list of NULLIF'd unquoted fields for valid lines of `src`."""
-    # On a valid line quotes appear only around whole fields, so deleting every quote unquotes all fields.
-    cols = ", ".join(f"NULLIF(f[{i + 1}], '') AS {n}" for i, n in enumerate(names))
-    return (f"SELECT {cols} FROM (SELECT string_split(replace(l, '\"', ''), ',') AS f FROM {src} "
-            f"WHERE l IS NOT NULL AND regexp_full_match(l, '{line_re(arity)}'))")
+        return "SELECT " + ", ".join(f"NULL::VARCHAR AS {n}" for n in names) + " WHERE false"
+    if mode == "fast":
+        cols = ", ".join(f"'c{i}': 'VARCHAR'" for i in range(k)) + ", 'x': 'VARCHAR'"
+        src = (f"read_csv('{glob}', columns={{{cols}}}, header=true, auto_detect=false, delim=',', quote='', "
+               f"escape='', new_line='\\n', nullstr=chr(10), null_padding=true, ignore_errors=true, "
+               f"strict_mode=true, comment='', skip=0)")
+        fields = [f"c{i}" for i in range(k)]
+        where = " AND ".join(["x IS NULL"] + [fok(f) for f in fields])
+    else:
+        src = (f"(SELECT string_split(l, ',') AS f FROM (SELECT unnest((string_split(content, chr(10)))[2:]) AS l "
+               f"FROM read_text('{glob}')))")
+        fields = [f"f[{i + 1}]" for i in range(k)]
+        where = " AND ".join([f"len(f) = {k}"] + [fok(f) for f in fields])
+    sel = ", ".join(f"{funq(f)} AS {n}" for f, n in zip(fields, names))
+    return f"SELECT {sel} FROM {src} WHERE {where}"
 
 
 def window_ms(con, s):
@@ -174,49 +156,57 @@ def run(data, out, scratch, ncpu, mem_gb, check=False):
             columns={{'campaign_id': 'VARCHAR', 'channel': 'VARCHAR'}}, header=true, auto_detect=false, delim=',', quote='"');
     """)
 
-    # ---- Stage A: raw lines
-    modes = [lines_sql(con, os.path.join(data, fam), f"raw_{fam}") for fam in ("events", "clicks", "links")]
-    stage("read_lines", "SELECT 1")
-    log(f"line readers: {modes}")
+    modes = {}
 
-    # ---- Stage C: events. Parse -> dedup on event_id (earliest ingest_ts) -> validate -> late -> category
-    stage("ev_dedup", f"""
-        CREATE TEMP TABLE ev_kept AS
-        SELECT event_id, min(ingest_ts) AS ingest_ts,
-               arg_min({{'u': user_id, 'ts': ts, 'et': event_type, 'p': product_id, 'pr': price_cents}}, ingest_ts) AS k
-        FROM ({fields_sql('raw_events', 7, ['event_id', 'user_id', 'ts', 'ingest_ts', 'event_type', 'product_id', 'price_cents'])})
-        WHERE event_id IS NOT NULL
-        GROUP BY event_id
-    """)
-    stage("ev_valid", f"""
+    def fam_stage(name, fam, names, build):
+        """Run a stage whose input is CSV family `fam`; fast reader first, exact reader if it refuses."""
+        folder = os.path.join(data, fam)
+        try:
+            stage(name, build(family_sql(folder, names, "fast")))
+            modes[fam] = "fast"
+        except duckdb.Error as error:
+            log(f"{fam}: fast reader refused ({str(error).splitlines()[0][:80]}); exact byte split")
+            con.execute(f"DROP TABLE IF EXISTS {name}")
+            stage(name, build(family_sql(folder, names, "exact")))
+            modes[fam] = "exact"
+
+    # ---- Stages A+C: events. Parse -> dedup on event_id (earliest ingest_ts) -> validate -> late -> category
+    ev_names = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"]
+    fam_stage("ev", "events", ev_names, lambda src: f"""
         CREATE TEMP TABLE ev AS
+        WITH kept AS MATERIALIZED (
+            SELECT k.u AS user_id, ts_ms(k.ts) AS ts, epoch_ms(try_strptime(ing, '%Y-%m-%dT%H:%M:%SZ')) AS its,
+                   k.et AS et, k.p AS product_id, k.pr AS pr
+            FROM (
+                SELECT min(ingest_ts) AS ing,
+                       arg_min({{'u': user_id, 'ts': ts, 'et': event_type, 'p': product_id, 'pr': price_cents}}, ingest_ts) AS k
+                FROM ({src}) WHERE event_id IS NOT NULL GROUP BY event_id
+            )
+            WHERE k.u IS NOT NULL AND k.p IS NOT NULL AND k.et IN ('view', 'cart', 'purchase')
+        ), priced AS MATERIALIZED (
+            SELECT user_id, ts, et = 'purchase' AS is_p, CASE WHEN et = 'purchase' THEN price_val(pr) END AS price, product_id
+            FROM kept WHERE ts BETWEEN {ws} AND {we - 1} AND its - ts <= {DAY_MS}
+        )
         SELECT user_id, ts, is_p, price, COALESCE(pr.category, 'unknown') AS category
-        FROM (
-            SELECT k.u AS user_id, ts_ms(k.ts) AS ts, ts_ms(ingest_ts) AS its, k.et = 'purchase' AS is_p,
-                   CASE WHEN k.et = 'purchase' THEN price_val(k.pr) END AS price, k.p AS product_id, k.et AS et
-            FROM ev_kept
-        ) e LEFT JOIN products pr USING (product_id)
-        WHERE user_id IS NOT NULL AND ts IS NOT NULL AND ts >= {ws} AND ts < {we}
-          AND et IN ('view', 'cart', 'purchase') AND product_id IS NOT NULL
-          AND (NOT is_p OR price IS NOT NULL)
-          AND its - ts <= {DAY_MS}
+        FROM priced LEFT JOIN products pr USING (product_id)
+        WHERE NOT is_p OR price IS NOT NULL
     """)
 
-    # ---- Stage F (part 1): clicks. Parse -> dedup -> validate
-    stage("clicks", f"""
+    # ---- Stages A+F (part 1): clicks. Parse -> dedup -> validate
+    fam_stage("clk", "clicks", ["click_id", "user_id", "campaign_id", "ts"], lambda src: f"""
         CREATE TEMP TABLE clk AS
         SELECT click_id, user_id, campaign_id, ts FROM (
             SELECT click_id, first(user_id) AS user_id, first(campaign_id) AS campaign_id, ts_ms(first(ts)) AS ts
-            FROM ({fields_sql('raw_clicks', 4, ['click_id', 'user_id', 'campaign_id', 'ts'])})
-            WHERE click_id IS NOT NULL GROUP BY click_id
+            FROM ({src}) WHERE click_id IS NOT NULL GROUP BY click_id
         ) c SEMI JOIN campaigns USING (campaign_id)
-        WHERE user_id IS NOT NULL AND ts IS NOT NULL AND ts >= {cws} AND ts < {we}
+        WHERE user_id IS NOT NULL AND ts BETWEEN {cws} AND {we - 1}
     """)
 
-    # ---- Stage D: identity resolution
-    stage("links", f"""
-        CREATE TEMP TABLE lnk AS SELECT a, b FROM ({fields_sql('raw_links', 2, ['a', 'b'])}) WHERE a IS NOT NULL AND b IS NOT NULL
+    # ---- Stages A+D: links, identity resolution
+    fam_stage("lnk", "links", ["a", "b"], lambda src: f"""
+        CREATE TEMP TABLE lnk AS SELECT a, b FROM ({src}) WHERE a IS NOT NULL AND b IS NOT NULL
     """)
+    log(f"readers: {modes}")
     stage("universe", """
         CREATE TEMP TABLE uni AS
         SELECT id, (row_number() OVER (ORDER BY id) - 1)::INTEGER AS idx FROM (
