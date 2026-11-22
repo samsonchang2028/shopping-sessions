@@ -182,3 +182,12 @@ Ev 48 -> 32 B: dropped `uk` (the universe tuples are written at parse time now),
 (24.8 days). 20M local, A/B min of 6: 2.32 -> 2.26 s. Output identical.
 Did NOT help (reverted): NB 256 -> 1024 dedup buckets (2.29 -> 2.32 s), and 1024 buckets with a software write-combining
 stage (2 records per bucket staged, then block-copied): 2.28 -> 2.35 s. Parse-side partition cost outweighs the smaller dedup tables here.
+
+## Link components off the critical path (redesign step 4)
+
+Links are parsed first; a side thread builds link components during event/click parse, tracking at each union-find root
+the member with the smallest id bytes (byte compare at union time, ~1M compares). The global byte sort of the universe,
+`rank`, and the serial union loop are gone: a person is numbered by the dense universe index of its component's smallest id,
+and PkTable is filled in parallel from the shard tables plus the link-name map. 20M local A/B min of 6: 2.26 -> 2.11 s.
+Output identical (20M compare, 36/36 fixtures, 10/10 fuzz). Largest-bucket-first (rayon fold over sorted bucket order) gave nothing
+measurable (2.25 -> 2.22 noisy; with_max_len(1) was +0.09 because each task allocates its own Worker); reverted.

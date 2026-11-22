@@ -665,6 +665,45 @@ fn dedup_bucket<T: Copy + Send + Sync>(
     out
 }
 
+/// Components of the link graph. Returns, for every linked id whose component's smallest id (by bytes) is another id,
+/// the hash of that smallest id. Ids that name their own component are absent.
+fn link_components(links: &[(u64, u32, Raw, u64, u32, Raw)]) -> IdMap<u64> {
+    let mut idx: IdMap<u32> = IdMap::with_capacity_and_hasher(links.len() * 2, Default::default());
+    let mut nodes: Vec<(u64, Raw)> = Vec::with_capacity(links.len() * 2);
+    let mut edges: Vec<(u32, u32)> = Vec::with_capacity(links.len());
+    for &(ha, _, a, hb, _, b) in links {
+        let mut node = |uh: u64, r: Raw| -> u32 {
+            *idx.entry(uh).or_insert_with(|| {
+                nodes.push((uh, r));
+                (nodes.len() - 1) as u32
+            })
+        };
+        let (ia, ib) = (node(ha, a), node(hb, b));
+        edges.push((ia, ib));
+    }
+    let m = nodes.len();
+    let mut parent: Vec<u32> = (0..m as u32).collect();
+    let mut best: Vec<u32> = (0..m as u32).collect(); // per root: node with the smallest id bytes
+    for &(ia, ib) in &edges {
+        let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
+        if ra != rb {
+            if nodes[best[rb as usize] as usize].1.get() < nodes[best[ra as usize] as usize].1.get() {
+                best[ra as usize] = best[rb as usize];
+            }
+            parent[rb as usize] = ra;
+        }
+    }
+    let mut out: IdMap<u64> = IdMap::default();
+    for i in 0..m as u32 {
+        let r = find(&mut parent, i);
+        let name = nodes[best[r as usize] as usize].0;
+        if name != nodes[i as usize].0 {
+            out.insert(nodes[i as usize].0, name);
+        }
+    }
+    out
+}
+
 fn find(parent: &mut [u32], mut x: u32) -> u32 {
     let mut r = x;
     while parent[r as usize] != r {
@@ -1084,6 +1123,31 @@ fn main() {
     }
     lg.log("dims");
 
+    // ---- links
+    let lk_files = map_files(&data.join("links"));
+    let lk_chunks = chunks(&lk_files);
+    let links: Vec<(u64, u32, Raw, u64, u32, Raw)> = lk_chunks
+        .par_iter()
+        .flat_map_iter(|c| {
+            let b = &lk_files[c.file][c.start..c.end];
+            let mut v = vec![];
+            scan::<2>(b, |_, [a, bb]| {
+                if !a.is_empty() && !bb.is_empty() {
+                    let ((ha, ka), (hb, kb)) = (uhash(a), uhash(bb));
+                    v.push((ha, ka, Raw::of(a), hb, kb, Raw::of(bb)));
+                }
+            });
+            v
+        })
+        .collect();
+    lg.log(&format!("links: {}", links.len()));
+    // Link components are computed on a side thread while events and clicks parse.
+    let links = Arc::new(links);
+    let link_thread = {
+        let links = Arc::clone(&links);
+        std::thread::spawn(move || link_components(&links))
+    };
+
     // ---- events: parse + hash-partition
     let ev_files = map_files(&data.join("events"));
     let ev_chunks = chunks(&ev_files);
@@ -1184,31 +1248,12 @@ fn main() {
     uparts.extend(cuparts);
     lg.log("clicks parsed");
 
-    // ---- links
-    let lk_files = map_files(&data.join("links"));
-    let lk_chunks = chunks(&lk_files);
-    let links: Vec<(u64, u32, Raw, u64, u32, Raw)> = lk_chunks
-        .par_iter()
-        .flat_map_iter(|c| {
-            let b = &lk_files[c.file][c.start..c.end];
-            let mut v = vec![];
-            scan::<2>(b, |_, [a, bb]| {
-                if !a.is_empty() && !bb.is_empty() {
-                    let ((ha, ka), (hb, kb)) = (uhash(a), uhash(bb));
-                    v.push((ha, ka, Raw::of(a), hb, kb, Raw::of(bb)));
-                }
-            });
-            v
-        })
-        .collect();
-    lg.log(&format!("links: {}", links.len()));
-
     // ---- ID universe, byte-sorted: index order is byte order, so the smallest index in a component is its name.
     // IDs were hashed once at parse time and split into 256 shards; each shard's distinct set is small enough to
     // stay in cache and is built in parallel, so there is nothing to merge.
     {
         let mut lb: Part = (0..NBU).map(|_| Vec::new()).collect();
-        for &(ha, ka, a, hb, kb, b) in &links {
+        for &(ha, ka, a, hb, kb, b) in links.iter() {
             lb[shard(ha)].push((ha, ka, a));
             lb[shard(hb)].push((hb, kb, b));
         }
@@ -1249,59 +1294,22 @@ fn main() {
     if n >= u32::MAX as usize - 1 {
         decline("too many ids");
     }
-    // Byte-wise sort of the distinct IDs. Comparing mapped bytes costs two cache misses per comparison, so sort by
-    // the first 8 bytes (big-endian, zero padded: this orders exactly like the bytes) and compare full bytes only
-    // when the prefixes are equal.
-    #[derive(Clone, Copy)]
-    struct SortEnt {
-        pre: u64,
-        code: u32,
-    }
-    let raws: Vec<Raw> = locals.iter().flat_map(|(l, _)| l.iter().copied()).collect();
-    let mut sorted: Vec<SortEnt> = raws
-        .par_iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let b = r.get();
-            let mut x = [0u8; 8];
-            let k = b.len().min(8);
-            x[..k].copy_from_slice(&b[..k]);
-            SortEnt { pre: u64::from_be_bytes(x), code: i as u32 }
-        })
-        .collect();
-    sorted.par_sort_unstable_by(|a, b| {
-        a.pre.cmp(&b.pre).then_with(|| raws[a.code as usize].get().cmp(raws[b.code as usize].get()))
-    });
-    lg.log("  universe: sorted");
-    let mut rank = vec![0u32; n];
-    for (r, e) in sorted.iter().enumerate() {
-        rank[e.code as usize] = r as u32;
-    }
-    let uni: Vec<&'static [u8]> = sorted.iter().map(|e| raws[e.code as usize].get()).collect();
-    drop(sorted);
-    // sorted index of an ID, given its hash and bytes
-    let id_idx = |uh: u64| -> usize {
-        let u = shard(uh);
-        rank[(base[u] + locals[u].1[&uh].1) as usize] as usize
-    };
+    // A person is numbered by the dense universe index of its component's smallest id (bytes); that id's bytes
+    // are the person's name. No global sort is needed: link components already know their smallest member.
+    let uni: Vec<&'static [u8]> = locals.iter().flat_map(|(l, _)| l.iter().map(|r| r.get())).collect();
     lg.log(&format!("universe: {n} ids"));
-
-    // ---- components, named by the smallest index
-    let mut parent: Vec<u32> = (0..n as u32).collect();
-    for &(ha, _, _, hb, _, _) in &links {
-        let (ia, ib) = (id_idx(ha) as u32, id_idx(hb) as u32);
-        let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
-        if ra != rb {
-            let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
-            parent[hi as usize] = lo;
-        }
-    }
-    let pk: Vec<u32> = (0..n as u32).map(|i| find(&mut parent, i)).collect();
-    // Flat id-hash -> person-key table, built in parallel from the shard tables.
+    let lm = link_thread.join().expect("link thread");
     let pkt = PkTable::new(n);
     locals.par_iter().enumerate().for_each(|(u, (_, map))| {
         for (&uh, v) in map.iter() {
-            pkt.insert(uh, pk[rank[(base[u] + v.1) as usize] as usize]);
+            let p = match lm.get(&uh) {
+                None => base[u] + v.1,
+                Some(&r) => {
+                    let ru = shard(r);
+                    base[ru] + locals[ru].1[&r].1
+                }
+            };
+            pkt.insert(uh, p);
         }
     });
     lg.log("components");
