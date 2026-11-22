@@ -546,19 +546,17 @@ fn chunks(files: &[Mmap]) -> Vec<Chunk> {
 
 // ---------------------------------------------------------------- records
 
-/// Event record, 48 bytes. `line` locates the source line; id and user are re-derived from it when needed.
+/// Event record, 32 bytes. `line` locates the source line; the id is re-derived from it on a hash match.
+/// `ts`: bit 31 = valid, low 31 bits = ms since window_start. `pc`: price (24 bits, 1..=10,000,000) in the low bits and
+/// the category (8 bits) in the top byte for a valid purchase, else 0 (a valid price is never 0, so `pc != 0` = purchase).
 #[derive(Clone, Copy)]
 struct Ev {
     h: u64,
     uh: u64,
     line: Raw,
-    ts: u32,  // ms since window_start, valid when `ok`
+    ts: u32,
     ing: u32, // ingest_ts in whole seconds since the epoch; u32::MAX if invalid
-    price: u32,
-    uk: u32,
-    cat: u16,
-    ok: bool,
-    purchase: bool,
+    pc: u32,
 }
 
 /// Click record, 40 bytes. `camp == u32::MAX` marks an invalid click.
@@ -1044,7 +1042,7 @@ fn main() {
     let ws = parse_ts(json_str(&manifest, "window_start").expect("window_start").as_bytes(), &mut dc0).expect("window_start");
     let we = parse_ts(json_str(&manifest, "window_end").expect("window_end").as_bytes(), &mut dc0).expect("window_end");
     let cws = ws - WEEK;
-    if we <= ws || we - cws >= (1 << 32) || ws < 0 {
+    if we <= ws || we - cws >= (1 << 31) || ws < 0 {
         decline("window too long or malformed for packed keys");
     }
     let ws_day = ws.div_euclid(DAY);
@@ -1072,7 +1070,7 @@ fn main() {
     cat_names.push(b"unknown".to_vec());
     cat_names.sort();
     cat_names.dedup();
-    if cat_names.len() >= u16::MAX as usize - 1 {
+    if cat_names.len() > 256 {
         decline("too many categories");
     }
     let cat_id: FMap<&[u8], u16> = cat_names.iter().enumerate().map(|(i, c)| (c.as_slice(), i as u16)).collect();
@@ -1133,17 +1131,13 @@ fn main() {
                 }
                 // the category is only used for purchase revenue; views and carts (97%) skip the lookup
                 let cat = if ok && purchase { prod.get(f[5]).copied().unwrap_or(unknown_cat) } else { 0 };
-                buckets[((h >> 24) & 0xff) as usize].push(Ev {
+                buckets[((h >> 24) as usize) & (NB - 1)].push(Ev {
                     h,
                     ing,
-                    ts: if ok { (ts.unwrap() - ws) as u32 } else { 0 },
+                    ts: if ok { (ts.unwrap() - ws) as u32 | 1 << 31 } else { 0 },
                     line: Raw::of(line),
                     uh,
-                    uk,
-                    price,
-                    cat,
-                    ok,
-                    purchase,
+                    pc: price | (cat as u32) << 24,
                 });
             });
             (buckets, ub)
@@ -1175,7 +1169,7 @@ fn main() {
                 let ts = parse_ts(f[3], &mut dc);
                 let camp = camp_idx.get(f[2]).copied();
                 let ok = !f[1].is_empty() && camp.is_some() && matches!(ts, Some(t) if t >= cws && t < we);
-                buckets[((h >> 24) & 0xff) as usize].push(Ck {
+                buckets[((h >> 24) as usize) & (NB - 1)].push(Ck {
                     h,
                     ts: if ok { (ts.unwrap() - cws) as u32 } else { 0 },
                     line: Raw::of(line),
@@ -1328,7 +1322,7 @@ fn main() {
                 |a: &Ev, b: &Ev| a.ing < b.ing,
                 |e: &Ev| (e.h, e.ing as u64),
             );
-            v.retain(|e| e.ok && e.ing as i64 * 1000 - (ws + e.ts as i64) <= DAY);
+            v.retain(|e| e.ts >> 31 == 1 && e.ing as i64 * 1000 - (ws + (e.ts & 0x7fff_ffff) as i64) <= DAY);
             let est = v.len() / NBK + v.len() / NBK / 4 + 8;
             let mut lb: Vec<Vec<E>> = (0..NBK).map(|_| Vec::with_capacity(est)).collect();
             for chunk in v.chunks(16) {
@@ -1338,10 +1332,10 @@ fn main() {
                 for e in chunk {
                     let p = pkt.get(e.uh);
                     lb[bucket_of(p)].push(E {
-                        key: ((p as u64) << 32) | e.ts as u64,
-                        price: e.price,
-                        cat: e.cat,
-                        purchase: e.purchase,
+                        key: ((p as u64) << 32) | (e.ts & 0x7fff_ffff) as u64,
+                        price: e.pc & 0xff_ffff,
+                        cat: (e.pc >> 24) as u16,
+                        purchase: e.pc != 0,
                     });
                 }
             }

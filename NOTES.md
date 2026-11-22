@@ -174,3 +174,11 @@ without events), so the universe, components and PkTable are built before dedup.
 bucket records directly: `ev_surv`/`ck_surv` and the separate bucket-by-person pass are gone. Output identical to the
 previous build (20M compare MATCH, 36/36 fixtures, 10/10 fuzz). 20M local: 2.31 s vs 2.33 s (min of 5, A/B), CPU 15.3 -> 14.6 s.
 Wall gain is within noise: the removed traffic was real, but parse writes one more tuple per event. Next: 32 B Ev record, buffered partitioning.
+
+## 32-byte Ev record, and buffered partitioning (redesign steps 2 and 3)
+
+Ev 48 -> 32 B: dropped `uk` (the universe tuples are written at parse time now), ok = bit 31 of `ts`, purchase = `pc != 0`
+(price 24 bits + category 8 bits; a valid price is never 0). Costs: exit 3 if > 256 categories or the window is >= 2^31 ms
+(24.8 days). 20M local, A/B min of 6: 2.32 -> 2.26 s. Output identical.
+Did NOT help (reverted): NB 256 -> 1024 dedup buckets (2.29 -> 2.32 s), and 1024 buckets with a software write-combining
+stage (2 records per bucket staged, then block-copied): 2.28 -> 2.35 s. Parse-side partition cost outweighs the smaller dedup tables here.
