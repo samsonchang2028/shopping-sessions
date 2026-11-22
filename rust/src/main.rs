@@ -1089,19 +1089,29 @@ fn main() {
     // ---- events: parse + hash-partition
     let ev_files = map_files(&data.join("events"));
     let ev_chunks = chunks(&ev_files);
-    let parts: Vec<Vec<Vec<Ev>>> = ev_chunks
+    // Every parsed user id also goes straight into the universe shards (users of dropped lines only add people
+    // without events, who never reach the output), so the universe does not have to wait for dedup.
+    const NBU: usize = 256;
+    type Part = Vec<Vec<(u64, u32, Raw)>>; // (hash, check, user id bytes)
+    let shard = |uh: u64| ((uh >> 48) & 0xff) as usize;
+    let (evparts, mut uparts): (Vec<Vec<Vec<Ev>>>, Vec<Part>) = ev_chunks
         .par_iter()
         .map(|c| {
             let b = &ev_files[c.file][c.start..c.end];
             let mut dc = DateCache::new();
             let est = b.len() / 80 / NB + 8;
             let mut buckets: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::with_capacity(est)).collect();
+            let uest = b.len() / 80 / NBU * 5 / 4 + 8;
+            let mut ub: Part = (0..NBU).map(|_| Vec::with_capacity(uest)).collect();
             scan::<7>(b, |line, f| {
                 if f[0].is_empty() {
                     return;
                 }
                 let h = hash_bytes(f[0]);
                 let (uh, uk) = if f[1].is_empty() { (0, 0) } else { uhash(f[1]) };
+                if uh != 0 {
+                    ub[shard(uh)].push((uh, uk, Raw::of(f[1])));
+                }
                 let ing = match parse_ts(f[3], &mut dc) {
                     None => u32::MAX,
                     Some(ms) if ms >= 0 && ms % 1000 == 0 && ms / 1000 < u32::MAX as i64 => (ms / 1000) as u32,
@@ -1136,46 +1146,32 @@ fn main() {
                     purchase,
                 });
             });
-            buckets
+            (buckets, ub)
         })
-        .collect();
+        .unzip();
     lg.log("events parsed");
-
-    // ---- events: dedup (earliest ingest_ts per event_id), then keep valid and not late
-    let ev_surv: Vec<Vec<Ev>> = (0..NB)
-        .into_par_iter()
-        .map(|b| {
-            let mut v = dedup_bucket(
-                &parts,
-                b,
-                |e: &Ev| e.h,
-                |e: &Ev| id_of(e.line),
-                |a: &Ev, b: &Ev| a.ing < b.ing,
-                |e: &Ev| (e.h, e.ing as u64),
-            );
-            v.retain(|e| e.ok && e.ing as i64 * 1000 - (ws + e.ts as i64) <= DAY);
-            v
-        })
-        .collect();
-    drop(parts);
-    lg.log(&format!("events deduped: {} kept", ev_surv.iter().map(|v| v.len()).sum::<usize>()));
 
     // ---- clicks
     let ck_files = map_files(&data.join("clicks"));
     let ck_chunks = chunks(&ck_files);
-    let cparts: Vec<Vec<Vec<Ck>>> = ck_chunks
+    let (cparts, cuparts): (Vec<Vec<Vec<Ck>>>, Vec<Part>) = ck_chunks
         .par_iter()
         .map(|c| {
             let b = &ck_files[c.file][c.start..c.end];
             let mut dc = DateCache::new();
             let est = b.len() / 50 / NB + 8;
             let mut buckets: Vec<Vec<Ck>> = (0..NB).map(|_| Vec::with_capacity(est)).collect();
+            let uest = b.len() / 50 / NBU * 5 / 4 + 8;
+            let mut ub: Part = (0..NBU).map(|_| Vec::with_capacity(uest)).collect();
             scan::<4>(b, |line, f| {
                 if f[0].is_empty() {
                     return;
                 }
                 let h = hash_bytes(f[0]);
                 let (uh, uk) = if f[1].is_empty() { (0, 0) } else { uhash(f[1]) };
+                if uh != 0 {
+                    ub[shard(uh)].push((uh, uk, Raw::of(f[1])));
+                }
                 let ts = parse_ts(f[3], &mut dc);
                 let camp = camp_idx.get(f[2]).copied();
                 let ok = !f[1].is_empty() && camp.is_some() && matches!(ts, Some(t) if t >= cws && t < we);
@@ -1188,26 +1184,11 @@ fn main() {
                     camp: if ok { camp.unwrap() } else { u32::MAX },
                 });
             });
-            buckets
+            (buckets, ub)
         })
-        .collect();
-    let ck_surv: Vec<Vec<Ck>> = (0..NB)
-        .into_par_iter()
-        .map(|b| {
-            let mut v = dedup_bucket(
-                &cparts,
-                b,
-                |c: &Ck| c.h,
-                |c: &Ck| id_of(c.line),
-                |_: &Ck, _: &Ck| false, // copies of a click are identical: keep the first
-                |c: &Ck| (c.h, 0),
-            );
-            v.retain(|c| c.camp != u32::MAX);
-            v
-        })
-        .collect();
-    drop(cparts);
-    lg.log(&format!("clicks parsed+deduped: {} kept", ck_surv.iter().map(|v| v.len()).sum::<usize>()));
+        .unzip();
+    uparts.extend(cuparts);
+    lg.log("clicks parsed");
 
     // ---- links
     let lk_files = map_files(&data.join("links"));
@@ -1229,43 +1210,17 @@ fn main() {
     lg.log(&format!("links: {}", links.len()));
 
     // ---- ID universe, byte-sorted: index order is byte order, so the smallest index in a component is its name.
-    // IDs are hashed once at parse time and split into 256 shards; each shard's distinct set is small enough to
+    // IDs were hashed once at parse time and split into 256 shards; each shard's distinct set is small enough to
     // stay in cache and is built in parallel, so there is nothing to merge.
-    const NBU: usize = 256;
-    type Part = Vec<Vec<(u64, u32, Raw, u8)>>; // (hash, check, line-or-user, 0 = line / 1 = user bytes)
-    let shard = |uh: u64| ((uh >> 48) & 0xff) as usize;
-    let mut parts: Vec<Part> = ev_surv
-        .par_iter()
-        .map(|v| {
-            let est = v.len() / NBU + v.len() / NBU / 4 + 8;
-            let mut lb: Part = (0..NBU).map(|_| Vec::with_capacity(est)).collect();
-            for e in v {
-                lb[shard(e.uh)].push((e.uh, e.uk, e.line, 0));
-            }
-            lb
-        })
-        .collect();
-    parts.extend(
-        ck_surv
-            .par_iter()
-            .map(|v| {
-                let est = v.len() / NBU + v.len() / NBU / 4 + 8;
-                let mut lb: Part = (0..NBU).map(|_| Vec::with_capacity(est)).collect();
-                for c in v {
-                    lb[shard(c.uh)].push((c.uh, c.uk, c.line, 0));
-                }
-                lb
-            })
-            .collect::<Vec<Part>>(),
-    );
     {
         let mut lb: Part = (0..NBU).map(|_| Vec::new()).collect();
         for &(ha, ka, a, hb, kb, b) in &links {
-            lb[shard(ha)].push((ha, ka, a, 1));
-            lb[shard(hb)].push((hb, kb, b, 1));
+            lb[shard(ha)].push((ha, ka, a));
+            lb[shard(hb)].push((hb, kb, b));
         }
-        parts.push(lb);
+        uparts.push(lb);
     }
+    let parts = uparts;
     lg.log("  universe: sharded");
     let locals: Vec<(Vec<Raw>, IdMap<(u32, u32)>)> = (0..NBU)
         .into_par_iter()
@@ -1273,7 +1228,7 @@ fn main() {
             let mut map: IdMap<(u32, u32)> = IdMap::default();
             let mut list: Vec<Raw> = vec![];
             for p in &parts {
-                for &(uh, uk, r, tag) in &p[u] {
+                for &(uh, uk, r) in &p[u] {
                     match map.entry(uh) {
                         std::collections::hash_map::Entry::Occupied(o) => {
                             if o.get().0 != uk {
@@ -1282,7 +1237,7 @@ fn main() {
                         }
                         std::collections::hash_map::Entry::Vacant(v) => {
                             v.insert((uk, list.len() as u32));
-                            list.push(if tag == 0 { Raw::of(user_of(r)) } else { r });
+                            list.push(r);
                         }
                     }
                 }
@@ -1361,9 +1316,19 @@ fn main() {
     const NBK: usize = 1024;
     let nn = (n as u64).max(1);
     let bucket_of = |p: u32| ((p as u64 * NBK as u64) / nn) as usize;
-    let evp: Vec<Vec<Vec<E>>> = ev_surv
-        .par_iter()
-        .map(|v| {
+    let evp: Vec<Vec<Vec<E>>> = (0..NB)
+        .into_par_iter()
+        .map(|b| {
+            // dedup (earliest ingest_ts per event_id), keep valid and not late, and write the person record directly
+            let mut v = dedup_bucket(
+                &evparts,
+                b,
+                |e: &Ev| e.h,
+                |e: &Ev| id_of(e.line),
+                |a: &Ev, b: &Ev| a.ing < b.ing,
+                |e: &Ev| (e.h, e.ing as u64),
+            );
+            v.retain(|e| e.ok && e.ing as i64 * 1000 - (ws + e.ts as i64) <= DAY);
             let est = v.len() / NBK + v.len() / NBK / 4 + 8;
             let mut lb: Vec<Vec<E>> = (0..NBK).map(|_| Vec::with_capacity(est)).collect();
             for chunk in v.chunks(16) {
@@ -1383,10 +1348,19 @@ fn main() {
             lb
         })
         .collect();
-    drop(ev_surv);
-    let ckp: Vec<Vec<Vec<C>>> = ck_surv
-        .par_iter()
-        .map(|v| {
+    drop(evparts);
+    let ckp: Vec<Vec<Vec<C>>> = (0..NB)
+        .into_par_iter()
+        .map(|b| {
+            let mut v = dedup_bucket(
+                &cparts,
+                b,
+                |c: &Ck| c.h,
+                |c: &Ck| id_of(c.line),
+                |_: &Ck, _: &Ck| false, // copies of a click are identical: keep the first
+                |c: &Ck| (c.h, 0),
+            );
+            v.retain(|c| c.camp != u32::MAX);
             let est = v.len() / NBK + v.len() / NBK / 4 + 8;
             let mut lb: Vec<Vec<C>> = (0..NBK).map(|_| Vec::with_capacity(est)).collect();
             for chunk in v.chunks(16) {
@@ -1401,8 +1375,8 @@ fn main() {
             lb
         })
         .collect();
-    drop(ck_surv);
-    lg.log("events and clicks bucketed by person");
+    drop(cparts);
+    lg.log("events and clicks deduped and bucketed by person");
 
     let ncat = cat_names.len();
     let cells = (ncamp + 1) * ndays;

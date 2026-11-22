@@ -166,3 +166,11 @@ What a redesign would change (estimates, unmeasured):
    nodes, which is safe) to drop the separate copy pass (~0.15 s).
 5. Components: sequential, 0.15 s; parallel hooking only if it still shows up.
 Realistic outcome of 1-4: about 1.5-2 s on this laptop. Reaching < 1 s probably also needs the scorer's quieter 8 vCPU Xeon.
+
+## Fused stages (redesign step 1)
+
+Universe shards are now filled at parse time (every parsed user id, even from lines later dropped; those only add people
+without events), so the universe, components and PkTable are built before dedup. Event/click dedup then writes the person
+bucket records directly: `ev_surv`/`ck_surv` and the separate bucket-by-person pass are gone. Output identical to the
+previous build (20M compare MATCH, 36/36 fixtures, 10/10 fuzz). 20M local: 2.31 s vs 2.33 s (min of 5, A/B), CPU 15.3 -> 14.6 s.
+Wall gain is within noise: the removed traffic was real, but parse writes one more tuple per event. Next: 32 B Ev record, buffered partitioning.
